@@ -1,0 +1,16 @@
+[package]
+name = "rocket-ebpf-ebpf"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+rocket-ebpf-common = { path = "../rocket-ebpf-common" }
+aya-ebpf = { workspace = true }
+aya-log-ebpf = { workspace = true }
+
+[build-dependencies]
+which = { workspace = true }
+
+[[bin]]
+name = "rocket-ebpf"
+path = "src/main.rs"

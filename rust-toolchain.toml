@@ -1,0 +1,4 @@
+[toolchain]
+channel = "nightly"
+components = ["rustfmt", "clippy"]
+# eBPF 目标与 bpf-linker 通常需要 nightly；若仅用 stable，请按 Aya 文档自行调整。

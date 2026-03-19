@@ -1,0 +1,35 @@
+[package]
+name = "rocket-ebpf"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rocket-ebpf-common = { path = "../rocket-ebpf-common" }
+
+anyhow = { workspace = true, default-features = true }
+aya = { workspace = true }
+clap = { workspace = true }
+aya-log = { workspace = true }
+env_logger = { workspace = true }
+libc = { workspace = true }
+log = { workspace = true }
+tokio = { workspace = true, features = [
+    "macros",
+    "rt",
+    "rt-multi-thread",
+    "signal",
+] }
+
+[build-dependencies]
+anyhow = { workspace = true }
+aya-build = { workspace = true }
+cargo_metadata = { workspace = true }
+rocket-ebpf-ebpf = { path = "../rocket-ebpf-ebpf" }
+
+[dev-dependencies]
+libc = { workspace = true }
+
+[[bin]]
+name = "rocket-ebpf"
+path = "src/main.rs"
