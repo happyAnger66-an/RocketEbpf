@@ -9,7 +9,7 @@ use clap::{Parser, Subcommand};
     long_about = "RocketEbpf 将内核态 eBPF 与用户态加载器打包在同一二进制中。\n\
 请选择子命令以附加对应 tracepoint；一般需要 root 或 CAP_BPF 等权限。\n\
 内核侧日志由 aya-log 送到用户态，可通过环境变量 RUST_LOG（如 info、debug）控制详细程度。",
-    after_long_help = "示例:\n  rocket-ebpf --help\n  rocket-ebpf exec --help\n  sudo RUST_LOG=info rocket-ebpf exec\n  sudo RUST_LOG=info rocket-ebpf open\n  sudo rocket-ebpf func hz /usr/lib/x86_64-linux-gnu/libc.so.6 malloc --pid 1234",
+    after_long_help = "示例:\n  rocket-ebpf --help\n  rocket-ebpf exec --help\n  sudo RUST_LOG=info rocket-ebpf exec\n  sudo RUST_LOG=info rocket-ebpf open\n  sudo rocket-ebpf func hz /usr/lib/x86_64-linux-gnu/libc.so.6 malloc --pid 1234\n  sudo rocket-ebpf func latency /usr/lib/x86_64-linux-gnu/libc.so.6 malloc --pid 1234\n  sudo rocket-ebpf func hz /path/to/libfoo.so 'ns::Bar::run' --cxx --pid 1234",
     propagate_version = true,
 )]
 pub struct Cli {
@@ -42,15 +42,21 @@ pub enum Commands {
 #[derive(Debug, Subcommand)]
 pub enum FuncCmd {
     /// 按时间间隔打印符号命中累计值与区间增量
-    Hz(HzArgs),
+    Hz(FuncProbeArgs),
+    /// uprobe + uretprobe 统计函数每次调用耗时（纳秒），打印累计调用次数与平均耗时
+    Latency(FuncProbeArgs),
 }
 
+/// `func hz` / `func latency` 共用的库路径、符号与过滤选项。
 #[derive(Debug, Parser)]
-pub struct HzArgs {
+pub struct FuncProbeArgs {
     /// 共享库路径（推荐绝对路径；亦可为 ld.so.cache 能解析的短名，如 libc.so.6）
     pub library: std::path::PathBuf,
-    /// 动态符号名（如 malloc；须能被 Aya 在对应 ELF 中解析）
+    /// 符号名：默认可直接写 ELF 动态符号（C++ 常见为 `_Z...` mangled）；`--cxx` 时为 demangle 全名或唯一子串，也可仍传 mangled
     pub symbol: String,
+    /// 按 C++（Itanium ABI）解修饰后匹配 `symbol`，并解析出 mangled 名再附加 uprobe
+    #[arg(long)]
+    pub cxx: bool,
     /// 仅统计该 PID：交给内核 uprobe 过滤（通常为线程组组长 PID）
     #[arg(long)]
     pub pid: Option<u32>,

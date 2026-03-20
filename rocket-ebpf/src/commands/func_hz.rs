@@ -6,15 +6,21 @@ use aya::programs::UProbe;
 use aya::Ebpf;
 use tokio::signal;
 
-use crate::cli::HzArgs;
+use crate::cli::FuncProbeArgs;
 
-pub async fn run(ebpf: &mut Ebpf, args: HzArgs) -> anyhow::Result<()> {
-    let HzArgs {
+pub async fn run(ebpf: &mut Ebpf, args: FuncProbeArgs) -> anyhow::Result<()> {
+    let FuncProbeArgs {
         library,
         symbol,
+        cxx,
         pid,
         interval,
     } = args;
+
+    let so_path = crate::cxx_symbol::resolve_so_for_attach(&library, pid)
+        .context("解析共享库路径（C++ 匹配需能读取磁盘上的 .so）")?;
+    let attach_symbol =
+        crate::cxx_symbol::resolve_probe_symbol(&so_path, &symbol, cxx).context("符号解析")?;
 
     {
         let program: &mut UProbe = ebpf
@@ -25,12 +31,13 @@ pub async fn run(ebpf: &mut Ebpf, args: HzArgs) -> anyhow::Result<()> {
         program.load().context("加载 uprobe 程序失败")?;
         let pid_filter = pid.map(|p| p as libc::pid_t);
         let _ = program
-            .attach(Some(symbol.as_str()), 0, &library, pid_filter)
+            .attach(Some(attach_symbol.as_str()), 0, &library, pid_filter)
             .with_context(|| {
                 format!(
-                    "附加 uprobe 失败：library={} symbol={} pid={pid:?}",
+                    "附加 uprobe 失败：library={} symbol={} (ELF={}) pid={pid:?}",
                     library.display(),
-                    symbol
+                    attach_symbol,
+                    so_path.display()
                 )
             })?;
     }
@@ -43,9 +50,11 @@ pub async fn run(ebpf: &mut Ebpf, args: HzArgs) -> anyhow::Result<()> {
 
     let interval_secs = interval.max(1);
     eprintln!(
-        "已附加 uprobe：库={} 符号={}；内核 PID 过滤={:?}；每 {}s 打印累计命中与区间增量。Ctrl-C 退出…",
+        "已附加 uprobe：库={} 请求={}{} 附加={}；内核 PID 过滤={:?}；每 {}s 打印累计命中与区间增量。Ctrl-C 退出…",
         library.display(),
         symbol,
+        if cxx { " (C++ 匹配) " } else { " " },
+        attach_symbol,
         pid,
         interval_secs
     );

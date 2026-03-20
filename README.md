@@ -2,8 +2,6 @@
 
 基于 **Rust** 与 **[Aya](https://github.com/aya-rs/aya)** 的 eBPF 观测与性能分析项目骨架。内核态程序编译为 eBPF 字节码，用户态加载、附加到钩子并处理数据（日志、环形缓冲、映射等）。
 
-> 说明：若你本地习惯使用 `README.dm` 等文件名，仓库内统一采用 GitHub 默认的 **`README.md`**。
-
 ## 仓库布局
 
 采用与官方 **[aya-template](https://github.com/aya-rs/aya-template)** 相同的三 crate 工作区，便于内核态/用户态分离与共享类型扩展：
@@ -25,7 +23,7 @@
 
 ## 构建与运行
 
-入口为 CLI 二进制 **`rocket-ebpf`**，通过 **子命令** 选择要加载/附加的 eBPF 程序（实现见 `rocket-ebpf/src/cli.rs` 与 `rocket-ebpf/src/commands/`）。
+入口为 CLI 二进制 **`rocket-ebpf`**，通过 **子命令** 选择要加载/附加的 eBPF 程序（实现见 `rocket-ebpf/src/cli.rs` 与 `rocket-ebpf/src/commands/`）。**命令行用法汇总见 [CLI.md](CLI.md)。**
 
 ```bash
 cargo build --release
@@ -43,9 +41,14 @@ sudo RUST_LOG=info ./target/release/rocket-ebpf open
 # func hz：对共享库符号打 uprobe，按间隔打印累计命中与区间增量；--pid 仅统计该进程（内核过滤）
 sudo ./target/release/rocket-ebpf func hz /usr/lib/x86_64-linux-gnu/libc.so.6 malloc
 sudo ./target/release/rocket-ebpf func hz /usr/lib/x86_64-linux-gnu/libc.so.6 malloc --pid 1234 --interval 2
+
+# func latency：uprobe + uretprobe，打印累计调用、全程平均耗时与本周期平均耗时（纳秒）
+sudo ./target/release/rocket-ebpf func latency /usr/lib/x86_64-linux-gnu/libc.so.6 malloc --pid 1234
 ```
 
 `func hz`：符号须出现在 ELF 动态符号表中（可用 `readelf -Ws 库路径 | grep 符号` 粗查）；库路径建议用绝对路径，或在目标进程已映射时配合 `--pid` 以便从 `/proc/<pid>/maps` 解析（与 Aya `UProbe::attach` 行为一致）。
+
+**C++ 动态库**：ELF 里多为 **mangled**（`_Z...`），可先 `readelf -Ws libxx.so | c++filt` 对照 demangle 名。本工具支持 **`--cxx`**：用 demangle 后的**全名**或**在候选中唯一的子串**匹配（Itanium ABI，与 `cpp_demangle` 一致）；若仍有重载歧义，请改用更完整的 demangle 字符串，或直接传 **mangled** 名（此时不必加 `--cxx`，或加上且与 ELF 中字符串完全一致也可）。
 
 按 **Ctrl-C** 退出后，对应 attach 会随进程结束而释放。
 
@@ -91,10 +94,12 @@ sudo ./target/release/rocket-ebpf func hz /usr/lib/x86_64-linux-gnu/libc.so.6 ma
 ROCKETEBPF_E2E=1 cargo test -p rocket-ebpf --test e2e -- --ignored
 ```
 
-默认会执行：
+**始终运行的用例**（不需 root）包括：`cli_help_smoke`、`cli_version_smoke`、`cli_subcommand_help_smoke`、`cli_func_help_mentions_probe_flags`、`cli_unknown_subcommand_fails` 等。
 
-- `cli_help_smoke`：验证 `rocket-ebpf --help`/`--help` 输出可用
-- `e2e_exec_attach_outputs_exec_event`：附加 `sched:sched_process_exec` 并触发一次 exec，验证输出包含 `exec pid=`
+**`#[ignore]` 用例**（需 `ROCKETEBPF_E2E=1` 且 root）：
+
+- `e2e_exec_attach_outputs_exec_event`：附加 `sched:sched_process_exec`，触发 exec，stderr 中出现 `exec pid=`
+- `e2e_open_attach_outputs_openat_log`：附加 `sys_enter_openat`，触发 `openat`，日志中出现 `openat enter`
 
 ## 延伸阅读
 

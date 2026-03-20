@@ -1,5 +1,6 @@
 mod cli;
 mod commands;
+mod cxx_symbol;
 mod ebpf;
 
 use clap::Parser;
@@ -16,8 +17,9 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         cli::Commands::Exec => commands::run_exec(&mut ebpf).await,
         cli::Commands::Open => commands::run_open(&mut ebpf).await,
-        cli::Commands::Func(cli::FuncCmd::Hz(args)) => {
-            commands::run_func_hz(&mut ebpf, args).await
-        }
+        cli::Commands::Func(sub) => match sub {
+            cli::FuncCmd::Hz(args) => commands::run_func_hz(&mut ebpf, args).await,
+            cli::FuncCmd::Latency(args) => commands::run_func_latency(&mut ebpf, args).await,
+        },
     }
 }

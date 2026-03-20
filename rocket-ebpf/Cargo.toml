@@ -9,7 +9,13 @@ rocket-ebpf-common = { path = "../rocket-ebpf-common" }
 
 anyhow = { workspace = true, default-features = true }
 aya = { workspace = true }
+cpp_demangle = "0.4"
 clap = { workspace = true }
+object = { version = "0.36", default-features = false, features = [
+    "elf",
+    "read_core",
+    "std",
+] }
 aya-log = { workspace = true }
 env_logger = { workspace = true }
 libc = { workspace = true }

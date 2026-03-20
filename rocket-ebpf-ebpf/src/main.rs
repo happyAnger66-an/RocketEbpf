@@ -4,13 +4,14 @@
 use aya_ebpf::{
     EbpfContext,
     helpers::{
-        bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_probe_read_kernel,
+        bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_ktime_get_ns, bpf_probe_read_kernel,
         bpf_probe_read_kernel_str_bytes,
     },
-    macros::{map, tracepoint, uprobe},
-    maps::PerCpuArray,
-    programs::{ProbeContext, TracePointContext},
+    macros::{map, tracepoint, uprobe, uretprobe},
+    maps::{HashMap, PerCpuArray},
+    programs::{ProbeContext, RetProbeContext, TracePointContext},
 };
+use rocket_ebpf_common::FuncLatencyAgg;
 use aya_log_ebpf::info;
 
 /// `sched:sched_process_exec` 的 trace 记录布局（`struct trace_entry` 8 字节后）：
@@ -31,6 +32,14 @@ static EXEC_SCRATCH: PerCpuArray<ExecScratch> = PerCpuArray::with_max_entries(1,
 /// 用户态 uprobe 命中计数（每 CPU 一条，用户态汇总）
 #[map]
 static FUNC_HZ_HITS: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
+
+/// 函数延迟：`tgid<<32|tid` -> 入口 `bpf_ktime_get_ns`
+#[map]
+static FUNC_LAT_START: HashMap<u64, u64> = HashMap::with_max_entries(16384, 0);
+
+/// 每 CPU 上完成的调用次数与耗时和（用于全局平均）
+#[map]
+static FUNC_LAT_AGG: PerCpuArray<FuncLatencyAgg> = PerCpuArray::with_max_entries(1, 0);
 
 #[tracepoint]
 pub fn sched_process_exec(ctx: TracePointContext) -> u32 {
@@ -112,6 +121,35 @@ pub fn func_hz_hit(_ctx: ProbeContext) -> u32 {
         unsafe {
             *p = (*p).wrapping_add(1);
         }
+    }
+    0
+}
+
+#[uprobe]
+pub fn func_lat_entry(_ctx: ProbeContext) -> u32 {
+    let key = bpf_get_current_pid_tgid();
+    let now = unsafe { bpf_ktime_get_ns() };
+    let _ = FUNC_LAT_START.insert(&key, &now, 0);
+    0
+}
+
+#[uretprobe]
+pub fn func_lat_ret(_ctx: RetProbeContext) -> u32 {
+    let key = bpf_get_current_pid_tgid();
+    let Some(start_ptr) = FUNC_LAT_START.get_ptr(&key) else {
+        return 0;
+    };
+    let start = unsafe { *start_ptr };
+    let _ = FUNC_LAT_START.remove(&key);
+    let now = unsafe { bpf_ktime_get_ns() };
+    let lat = now.saturating_sub(start);
+    let Some(p) = FUNC_LAT_AGG.get_ptr_mut(0) else {
+        return 0;
+    };
+    unsafe {
+        let a = &mut *p;
+        a.count = a.count.wrapping_add(1);
+        a.sum_ns = a.sum_ns.wrapping_add(lat);
     }
     0
 }
