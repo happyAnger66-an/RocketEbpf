@@ -150,12 +150,11 @@ rocket-ebpf func hz --help
 
 ## `func latency`
 
-在指定符号上同时附加 **uprobe（入口）** 与 **uretprobe（返回）**，用 `bpf_ktime_get_ns` 计算每次调用的耗时（纳秒），按 CPU 聚合 **调用次数** 与 **耗时之和**，用户态汇总后打印：
+在指定符号上同时附加 **uprobe（入口）** 与 **uretprobe（返回）**，用 `bpf_ktime_get_ns` 计算每次调用的耗时（纳秒），按 CPU 聚合 **次数 / 时间和 / 本周期内该 CPU 上的 min-max**；每个打印周期结束后用户态**清零**内核 map，再在用户态累加 **累计 calls/sum** 以计算全程平均。
 
-- **`calls`**：累计完成 return 的次数（与 entry 配对的返回；若进程在函数内被杀死等可能少计）。
-- **`avg_ns`**：自启动以来 **总耗时 / 总次数**。
-- **`interval_avg_ns`**：本打印周期内 **新增样本** 的平均耗时。
-- **`(+N)`**：本周期内新增的完成调用次数。
+- **`calls` / `avg_ns`**：自进程启动以来的累计完成次数与 **全程平均耗时**（用户态累加）。
+- **`(+N)` / `interval_avg_ns`**：刚过去的这一统计周期内的调用次数与平均耗时。
+- **`interval_min_ns` / `interval_max_ns`**：该周期内在**所有 CPU 上合并**后的单次耗时最小值与最大值（无样本时为 `n/a`）。
 
 位置参数与选项与 **`func hz`** 相同（**`LIBRARY`**、**`SYMBOL`**、**`--cxx`**、**`--pid`**、**`--interval`**）。
 

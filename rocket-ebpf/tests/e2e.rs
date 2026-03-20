@@ -74,13 +74,14 @@ fn cli_help_smoke() {
     let combined = combined_output(&out.stdout, &out.stderr);
 
     assert!(out.status.success(), "help should succeed: {out:?}");
+    // `about` 未必出现在完整 `--help` 中（`long_about` 优先）；此处只断言长说明里一定有的文案。
     for needle in [
         "Usage:",
         "Commands:",
         "exec",
         "open",
         "func",
-        "基于 Aya",
+        "RocketEbpf",
     ] {
         assert!(
             combined.contains(needle),

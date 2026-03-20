@@ -148,8 +148,20 @@ pub fn func_lat_ret(_ctx: RetProbeContext) -> u32 {
     };
     unsafe {
         let a = &mut *p;
+        let prev_c = a.count;
         a.count = a.count.wrapping_add(1);
         a.sum_ns = a.sum_ns.wrapping_add(lat);
+        if prev_c == 0 {
+            a.min_ns = lat;
+            a.max_ns = lat;
+        } else {
+            if lat < a.min_ns {
+                a.min_ns = lat;
+            }
+            if lat > a.max_ns {
+                a.max_ns = lat;
+            }
+        }
     }
     0
 }
