@@ -16,5 +16,8 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         cli::Commands::Exec => commands::run_exec(&mut ebpf).await,
         cli::Commands::Open => commands::run_open(&mut ebpf).await,
+        cli::Commands::Func(cli::FuncCmd::Hz(args)) => {
+            commands::run_func_hz(&mut ebpf, args).await
+        }
     }
 }

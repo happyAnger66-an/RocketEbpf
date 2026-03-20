@@ -39,7 +39,13 @@ sudo RUST_LOG=info ./target/release/rocket-ebpf exec
 
 # open：syscalls:sys_enter_openat（示例第二路 tracepoint）
 sudo RUST_LOG=info ./target/release/rocket-ebpf open
+
+# func hz：对共享库符号打 uprobe，按间隔打印累计命中与区间增量；--pid 仅统计该进程（内核过滤）
+sudo ./target/release/rocket-ebpf func hz /usr/lib/x86_64-linux-gnu/libc.so.6 malloc
+sudo ./target/release/rocket-ebpf func hz /usr/lib/x86_64-linux-gnu/libc.so.6 malloc --pid 1234 --interval 2
 ```
+
+`func hz`：符号须出现在 ELF 动态符号表中（可用 `readelf -Ws 库路径 | grep 符号` 粗查）；库路径建议用绝对路径，或在目标进程已映射时配合 `--pid` 以便从 `/proc/<pid>/maps` 解析（与 Aya `UProbe::attach` 行为一致）。
 
 按 **Ctrl-C** 退出后，对应 attach 会随进程结束而释放。
 

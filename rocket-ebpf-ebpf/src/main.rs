@@ -7,9 +7,9 @@ use aya_ebpf::{
         bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_probe_read_kernel,
         bpf_probe_read_kernel_str_bytes,
     },
-    macros::{map, tracepoint},
+    macros::{map, tracepoint, uprobe},
     maps::PerCpuArray,
-    programs::TracePointContext,
+    programs::{ProbeContext, TracePointContext},
 };
 use aya_log_ebpf::info;
 
@@ -27,6 +27,10 @@ struct ExecScratch {
 
 #[map]
 static EXEC_SCRATCH: PerCpuArray<ExecScratch> = PerCpuArray::with_max_entries(1, 0);
+
+/// 用户态 uprobe 命中计数（每 CPU 一条，用户态汇总）
+#[map]
+static FUNC_HZ_HITS: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
 
 #[tracepoint]
 pub fn sched_process_exec(ctx: TracePointContext) -> u32 {
@@ -100,6 +104,16 @@ pub fn sys_enter_openat(ctx: TracePointContext) -> u32 {
 fn try_sys_enter_openat(ctx: TracePointContext) -> Result<u32, u32> {
     info!(&ctx, "openat enter");
     Ok(0)
+}
+
+#[uprobe]
+pub fn func_hz_hit(_ctx: ProbeContext) -> u32 {
+    if let Some(p) = FUNC_HZ_HITS.get_ptr_mut(0) {
+        unsafe {
+            *p = (*p).wrapping_add(1);
+        }
+    }
+    0
 }
 
 #[cfg(not(test))]

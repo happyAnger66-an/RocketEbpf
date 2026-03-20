@@ -33,6 +33,10 @@ fn cli_help_smoke() {
         combined.contains("Commands:"),
         "help output should contain Commands section"
     );
+    assert!(
+        combined.contains("func"),
+        "help output should list func subcommand"
+    );
 }
 
 // 端到端：加载 eBPF 并附加到 `sched:sched_process_exec`，再触发一次 exec。
