@@ -1,4 +1,5 @@
 [toolchain]
 channel = "nightly"
-components = ["rustfmt", "clippy"]
+# rust-src：aya_build 使用 -Z build-std=core，必须有标准库源码（否则报 library/Cargo.lock does not exist）。
+components = ["rustfmt", "clippy", "rust-src"]
 # eBPF 目标与 bpf-linker 通常需要 nightly；若仅用 stable，请按 Aya 文档自行调整。

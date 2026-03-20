@@ -19,7 +19,7 @@
 ## 环境要求
 
 - **Linux**（需支持 eBPF；内核建议较新并开启 **BTF**，便于 CO-RE 与部分程序类型）
-- **Rust**：本仓库含 `rust-toolchain.toml`，默认使用 **nightly**（与 Aya 文档及 eBPF 目标常见要求一致）
+- **Rust**：本仓库含 `rust-toolchain.toml`，默认使用 **nightly**（与 Aya 文档及 eBPF 目标常见要求一致）。文件中已声明 **`rust-src`**：`rocket-ebpf` 的 `aya_build` 会用 **`-Z build-std=core`** 编译 eBPF，没有 `rust-src` 会在新环境直接失败。在目录内首次跑 `cargo` 时，`rustup` 一般会自动装上声明的组件；若未装上，可手动执行：`rustup component add rust-src --toolchain nightly`。
 - **`bpf-linker`**：执行 `cargo install bpf-linker`（默认安装到 `~/.cargo/bin`）。**构建时 PATH 必须包含该目录**；若仅在 IDE 里点构建而失败，多为未继承 shell 的 PATH，可在工程或 IDE 环境里加上 `~/.cargo/bin`。`rocket-ebpf-ebpf/build.rs` 会先在 PATH 中查找 `bpf-linker`，再回退尝试 `$HOME/.cargo/bin/bpf-linker`。
 - 加载程序通常需要 **`CAP_BPF` / `CAP_PERFMON`** 等能力，开发期多用 **`sudo`** 运行用户态二进制
 
