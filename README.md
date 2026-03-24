@@ -1,5 +1,17 @@
 # RocketEbpf
 
+## 核心优势
+
++ 静态链接,只要支持ebpf的linux上可以一键使用,无需安装复杂依赖(如bcc等)
++ c++函数直接监控,解决c++函数命名重整的问题,可以直接输入用户友好的函数名
+如下面的'myns::Bar::run'函数监控
+
+```bash
+sudo ./target/release/rocket-ebpf func hz /path/to/libfoo.so 'myns::Bar::run' --cxx --pid 1234
+```
++ rust实现,性能和安全性有保障
+
+## 介绍
 基于 **Rust** 与 **[Aya](https://github.com/aya-rs/aya)** 的 eBPF 观测与性能分析项目骨架。内核态程序编译为 eBPF 字节码，用户态加载、附加到钩子并处理数据（日志、环形缓冲、映射等）。
 
 ## 仓库布局
