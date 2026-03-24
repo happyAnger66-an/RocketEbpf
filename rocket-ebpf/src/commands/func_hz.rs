@@ -4,9 +4,17 @@ use anyhow::Context as _;
 use aya::maps::{PerCpuArray, PerCpuValues};
 use aya::programs::UProbe;
 use aya::Ebpf;
+use aya::Pod;
+use rocket_ebpf_common::FuncHzPerCpu;
 use tokio::signal;
 
 use crate::cli::FuncProbeArgs;
+
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+struct FuncHzPerCpuPod(FuncHzPerCpu);
+
+unsafe impl Pod for FuncHzPerCpuPod {}
 
 pub async fn run(ebpf: &mut Ebpf, args: FuncProbeArgs) -> anyhow::Result<()> {
     let FuncProbeArgs {
@@ -42,15 +50,15 @@ pub async fn run(ebpf: &mut Ebpf, args: FuncProbeArgs) -> anyhow::Result<()> {
             })?;
     }
 
-    let hits = PerCpuArray::<_, u64>::try_from(
-        ebpf.map_mut("FUNC_HZ_HITS")
-            .context("未找到 map FUNC_HZ_HITS")?,
+    let hits = PerCpuArray::<_, FuncHzPerCpuPod>::try_from(
+        ebpf.map_mut("FUNC_HZ_STATS")
+            .context("未找到 map FUNC_HZ_STATS")?,
     )
-    .context("打开 FUNC_HZ_HITS 失败")?;
+    .context("打开 FUNC_HZ_STATS 失败")?;
 
     let interval_secs = interval.max(1);
     eprintln!(
-        "已附加 uprobe：库={} 请求={}{} 附加={}；内核 PID 过滤={:?}；每 {}s 打印累计命中与区间增量。Ctrl-C 退出…",
+        "已附加 uprobe：库={} 请求={}{} 附加={}；内核 PID 过滤={:?}；每 {}s 打印累计命中、区间增量及各 CPU 上相邻命中间隔的全局最大 max_gap_ns（ns）。Ctrl-C 退出…",
         library.display(),
         symbol,
         if cxx { " (C++ 匹配) " } else { " " },
@@ -68,12 +76,13 @@ pub async fn run(ebpf: &mut Ebpf, args: FuncProbeArgs) -> anyhow::Result<()> {
                 break;
             }
             _ = tokio::time::sleep(Duration::from_secs(interval_secs)) => {
-                let vals: PerCpuValues<u64> =
-                    hits.get(&0, 0).context("读取 FUNC_HZ_HITS 失败")?;
-                let total: u64 = vals.iter().copied().sum();
+                let vals: PerCpuValues<FuncHzPerCpuPod> =
+                    hits.get(&0, 0).context("读取 FUNC_HZ_STATS 失败")?;
+                let total: u64 = vals.iter().map(|v| v.0.hits).sum();
+                let max_gap_ns: u64 = vals.iter().map(|v| v.0.max_gap_ns).max().unwrap_or(0);
                 let delta = total.saturating_sub(prev_total);
                 prev_total = total;
-                println!("hits={total} (+{delta})");
+                println!("hits={total} (+{delta}) max_gap_ns={max_gap_ns}");
             }
         }
     }

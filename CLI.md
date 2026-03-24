@@ -119,11 +119,12 @@ rocket-ebpf func hz <LIBRARY> <SYMBOL> [选项]
 |--------|------|
 | **`--cxx`** | 将 `SYMBOL` 解释为 **C++（Itanium ABI）** demangle 后的**全名**或**在候选中唯一的子串**；在 `.so` 内解析出对应 **mangled** 后再附加。多重重载匹配不唯一时会报错并列候选。 |
 | **`--pid <PID>`** | 只在该 **进程上下文**中触发 uprobe（内核过滤；一般为线程组 leader PID）。 |
-| **`--interval <秒>`** | 打印间隔，默认 **`1`**。每次打印形如：`hits=<累计> (+<本区间增量>)` |
+| **`--interval <秒>`** | 打印间隔，默认 **`1`**。每次打印形如：`hits=<累计> (+<本区间增量>) max_gap_ns=<ns>` |
 
 ### 行为简述
 
 - 不依赖 `RUST_LOG` 也能看到周期性的 `hits=` 行；附加成功时会在 stderr 打一行摘要。
+- **`max_gap_ns`**：在**每个 CPU** 上，相邻两次命中之间的时间间隔（`bpf_ktime_get_ns`）的**最大值**；用户态再对各 CPU 取 **max**，作为「全局展示值」。注意：命中若分散在不同 CPU 上，真实全局相邻间隔**不一定**等于该值（多核下为近似上界）。
 - **C++**：ELF 里多为 mangled，可用 `readelf -Ws libxx.so | c++filt` 对照；更简单是直接使用 **`--cxx`** + demangle 子串（唯一时）或手写 mangled（可不使用 **`--cxx`**）。
 
 ### 示例

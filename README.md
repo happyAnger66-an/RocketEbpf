@@ -38,7 +38,7 @@ sudo RUST_LOG=info ./target/release/rocket-ebpf exec
 # open：syscalls:sys_enter_openat（示例第二路 tracepoint）
 sudo RUST_LOG=info ./target/release/rocket-ebpf open
 
-# func hz：对共享库符号打 uprobe，按间隔打印累计命中与区间增量；--pid 仅统计该进程（内核过滤）
+# func hz：对共享库符号打 uprobe，按间隔打印累计命中、区间增量与各 CPU 相邻命中间隔的全局最大 max_gap_ns；--pid 仅统计该进程（内核过滤）
 sudo ./target/release/rocket-ebpf func hz /usr/lib/x86_64-linux-gnu/libc.so.6 malloc
 sudo ./target/release/rocket-ebpf func hz /usr/lib/x86_64-linux-gnu/libc.so.6 malloc --pid 1234 --interval 2
 
