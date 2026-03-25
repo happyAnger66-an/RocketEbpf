@@ -9,6 +9,7 @@ rocket-ebpf-common = { path = "../rocket-ebpf-common" }
 
 anyhow = { workspace = true, default-features = true }
 aya = { workspace = true }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 cpp_demangle = "0.4"
 clap = { workspace = true }
 object = { version = "0.36", default-features = false, features = [

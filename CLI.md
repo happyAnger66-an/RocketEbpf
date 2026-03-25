@@ -31,6 +31,7 @@ rocket-ebpf <子命令>
 | **`exec`** | 内核 tracepoint：`sched:sched_process_exec` |
 | **`open`** | 内核 tracepoint：`syscalls:sys_enter_openat` |
 | **`func`** | 用户态共享库探针：二级子命令 **`hz`**（计数）、**`latency`**（耗时） |
+| **`sched`** | 调度类 tracepoint：二级子命令 **`latency`**（进程内线程「唤醒→运行」延迟超阈值上报） |
 
 ---
 
@@ -185,18 +186,78 @@ rocket-ebpf func latency --help
 
 ---
 
+## `sched latency`
+
+针对**指定进程**（线程组组长 **PID**）内、列在 **`/proc/<pid>/task`** 下的所有线程，统计 **「被唤醒 → 在 `sched_switch` 中真正被切上 CPU」** 的调度延迟；当延迟 **严格大于** **`--threshold-ms`** 时，通过 **BPF ring buffer**（内核一般需 **≥ 5.8**）向用户态上报并打印一行。
+
+### 语法
+
+```bash
+rocket-ebpf sched latency --pid <PID> --threshold-ms <毫秒> [选项]
+```
+
+**`--pid`** 与 **`--threshold-ms`** 均为必选（由 `clap` 要求）。
+
+### 选项
+
+| 长选项 | 说明 |
+|--------|------|
+| **`--pid <PID>`** | 目标**进程** PID（线程组 leader）。仅统计该进程线程组内的线程；线程列表来自 **`/proc/<pid>/task`**。 |
+| **`--threshold-ms <毫秒>`** | 仅当测得延迟 **大于** 该值（毫秒，**严格大于**）时才输出一行。 |
+| **`--task-refresh-secs <秒>`** | 周期重新扫描 **`/proc/<pid>/task`**，把新建线程加入内核过滤表；默认 **`2`**。至少按 **`1`** 秒生效（实现上对过小值做了下限处理）。 |
+| **`--prev`** | 在输出中附带 **`sched_switch` 里被换下 CPU 的前任任务**：**`prev_tid`**、**`prev_comm`**（本 CPU 上的 `prev_pid` / `prev_comm`）。未加此开关时内核侧不读取 `prev` 字段，可略减开销。 |
+
+### 行为简述
+
+- **内核**：附加 **`sched:sched_waking`**（记录目标线程最近一次唤醒的 `bpf_ktime_get_ns`）与 **`sched:sched_switch`**（当 **`next_pid`** 为目标线程且 map 中有唤醒时间时计算延迟；超过阈值则 **`ringbuf` 输出**）。
+- **用户态**：启动时用 **`CLOCK_REALTIME`** 与 **`CLOCK_MONOTONIC`** 做一次对齐，把事件里的单调时间换算为**本地墙上时间**字符串（带时区偏移）。
+- **trace 载荷布局**：与当前主线 **`include/trace/events/sched.h`** 中 **`sched_wakeup_template`** / **`sched_switch`** 一致；当前实现按 **x86_64** 固定偏移解析。若你内核的 trace 布局不同，需改 `rocket-ebpf-ebpf/src/main.rs` 中的偏移常量。
+- **局限**：仅覆盖「经 **`sched_waking`** 路径唤醒后再被调度」的延迟；系统校时跳变时，墙上时间与单调时间的长期换算可能有偏差（对单次调度延迟尺度通常可忽略）。
+
+### 输出格式
+
+每行**无**固定前缀名；字段为 **`key=value`** 空格分隔（示例字段名如下）。
+
+- **默认**：`wall_local=`（本地时间，微秒精度 + 时区）、`tid=`（被调度上 CPU 的线程 TID）、`cpu=`、`latency_ms=`（本次唤醒→运行的延迟，毫秒，3 位小数）。
+- **`--prev`**：额外 `prev_tid=`、`prev_comm=`（该 CPU 上刚被换下的任务；`comm` 为内核任务名，最长 16 字节风格，与 `ps` 中 comm 类似）。
+
+示例（换行仅为阅读方便）：
+
+```text
+wall_local=2026-03-25 12:34:56.123456 +0800 tid=12345 cpu=2 latency_ms=12.345
+wall_local=2026-03-25 12:34:56.234567 +0800 tid=12346 cpu=0 latency_ms=8.100 prev_tid=999 prev_comm=kworker/0:0
+```
+
+### 示例
+
+```bash
+sudo ./target/release/rocket-ebpf sched latency --pid 1234 --threshold-ms 5
+
+sudo ./target/release/rocket-ebpf sched latency --pid 1234 --threshold-ms 2 --task-refresh-secs 1 --prev
+```
+
+### 帮助
+
+```bash
+rocket-ebpf sched --help
+rocket-ebpf sched latency --help
+```
+
+---
+
 ## 与文档、源码的对应关系
 
 | 文档 | 路径 |
 |------|------|
 | 项目总览与环境 | [README.md](README.md) |
 | CLI 定义 | `rocket-ebpf/src/cli.rs` |
-| `exec` / `open` / `func hz` / `func latency` 实现 | `rocket-ebpf/src/commands/` |
-| 延迟聚合结构（内核/用户态共享） | `rocket-ebpf-common` 中 `FuncLatencyAgg` |
+| `exec` / `open` / `func hz` / `func latency` / **`sched latency`** 实现 | `rocket-ebpf/src/commands/`（其中调度延迟为 **`sched_latency.rs`**） |
+| 内核程序与 map | `rocket-ebpf-ebpf/src/main.rs` |
+| 用户态/内核共享类型 | `rocket-ebpf-common`（如 **`FuncLatencyAgg`**、**`SchedLatConfig`**、**`SchedLatEvent`**、`FuncHzPerCpu` 等） |
 
 ### 自动化测试（`tests/e2e.rs`）
 
-- **无需 root**：根与子命令 `--help`、`--version`、非法子命令失败等。
+- **无需 root**：根与子命令 `--help`、`--version`、非法子命令失败等（含 **`sched`** / **`sched latency`** 的 help 冒烟）。
 - **需 root + `ROCKETEBPF_E2E=1`**（`#[ignore]`）：真实加载 eBPF 的 `exec` / `open` 附加与日志校验。
 
 详见 [README.md](README.md)「测试（e2e）」中的运行命令。

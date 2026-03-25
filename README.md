@@ -11,6 +11,9 @@ sudo ./target/release/rocket-ebpf func hz /path/to/libfoo.so 'myns::Bar::run' --
 ```
 + rust实现,性能和安全性有保障
 
+## 使用说明
+[使用手册](./CLI.md)
+
 ## 介绍
 基于 **Rust** 与 **[Aya](https://github.com/aya-rs/aya)** 的 eBPF 观测与性能分析项目骨架。内核态程序编译为 eBPF 字节码，用户态加载、附加到钩子并处理数据（日志、环形缓冲、映射等）。
 

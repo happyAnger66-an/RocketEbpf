@@ -21,5 +21,8 @@ async fn main() -> anyhow::Result<()> {
             cli::FuncCmd::Hz(args) => commands::run_func_hz(&mut ebpf, args).await,
             cli::FuncCmd::Latency(args) => commands::run_func_latency(&mut ebpf, args).await,
         },
+        cli::Commands::Sched(sub) => match sub {
+            cli::SchedCmd::Latency(args) => commands::run_sched_latency(&mut ebpf, args).await,
+        },
     }
 }

@@ -81,6 +81,7 @@ fn cli_help_smoke() {
         "exec",
         "open",
         "func",
+        "sched",
         "RocketEbpf",
     ] {
         assert!(
@@ -109,6 +110,8 @@ fn cli_subcommand_help_smoke() {
         &["func", "--help"],
         &["func", "hz", "--help"],
         &["func", "latency", "--help"],
+        &["sched", "--help"],
+        &["sched", "latency", "--help"],
     ];
 
     for args in cases {
@@ -163,6 +166,27 @@ fn cli_func_help_mentions_probe_flags() {
         c.contains("--interval"),
         "func latency --help should mention --interval\n{c}"
     );
+}
+
+#[test]
+fn cli_sched_latency_help_mentions_pid_and_threshold() {
+    let out = Command::new(exe())
+        .args(["sched", "latency", "--help"])
+        .output()
+        .expect("sched latency --help");
+    assert!(out.status.success());
+    let c = combined_output(&out.stdout, &out.stderr);
+    for needle in [
+        "--pid",
+        "--threshold-ms",
+        "--task-refresh-secs",
+        "--prev",
+    ] {
+        assert!(
+            c.contains(needle),
+            "sched latency --help should mention {needle:?}\n{c}"
+        );
+    }
 }
 
 #[test]
