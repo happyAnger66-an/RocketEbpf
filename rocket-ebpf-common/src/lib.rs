@@ -1,11 +1,18 @@
 //! 内核态与用户态共享的类型定义（`#[repr(C)]` 结构体、常量等）。
 #![no_std]
 
-/// `func hz` 在每 CPU 上的命中次数、上次命中时间与**本 CPU 上**相邻两次命中间隔的最大值（纳秒）。
+/// `func hz` 在每 CPU 上的命中次数（用 PerCPU map 累加，避免多核写同一计数丢更新）。
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct FuncHzPerCpu {
     pub hits: u64,
+}
+
+/// `func hz` 全局（所有 CPU 共享）的相邻命中间隔：上次任意 CPU 命中时间与本周期内观测到的最大间隔（纳秒）。
+/// 无锁读写在极端并发下可能与严格全序有细微偏差，但多线程/换核时远优于「按 CPU 分别算间隔」。
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct FuncHzGlobalGap {
     pub last_ts_ns: u64,
     pub max_gap_ns: u64,
 }

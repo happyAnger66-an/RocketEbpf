@@ -8,10 +8,10 @@ use aya_ebpf::{
         bpf_probe_read_kernel_str_bytes,
     },
     macros::{map, tracepoint, uprobe, uretprobe},
-    maps::{HashMap, PerCpuArray},
+    maps::{Array, HashMap, PerCpuArray},
     programs::{ProbeContext, RetProbeContext, TracePointContext},
 };
-use rocket_ebpf_common::{FuncHzPerCpu, FuncLatencyAgg};
+use rocket_ebpf_common::{FuncHzGlobalGap, FuncHzPerCpu, FuncLatencyAgg};
 use aya_log_ebpf::info;
 
 /// `sched:sched_process_exec` 的 trace 记录布局（`struct trace_entry` 8 字节后）：
@@ -29,9 +29,13 @@ struct ExecScratch {
 #[map]
 static EXEC_SCRATCH: PerCpuArray<ExecScratch> = PerCpuArray::with_max_entries(1, 0);
 
-/// `func hz`：每 CPU 命中数、上次时间戳、本 CPU 上相邻命中间隔最大值（ns）
+/// `func hz`：每 CPU 命中数
 #[map]
 static FUNC_HZ_STATS: PerCpuArray<FuncHzPerCpu> = PerCpuArray::with_max_entries(1, 0);
+
+/// `func hz`：全局相邻两次命中（任意 CPU）之间的最大间隔（ns）
+#[map]
+static FUNC_HZ_GAP: Array<FuncHzGlobalGap> = Array::with_max_entries(1, 0);
 
 /// 函数延迟：`tgid<<32|tid` -> 入口 `bpf_ktime_get_ns`
 #[map]
@@ -120,8 +124,12 @@ pub fn func_hz_hit(_ctx: ProbeContext) -> u32 {
     let now = unsafe { bpf_ktime_get_ns() };
     if let Some(p) = FUNC_HZ_STATS.get_ptr_mut(0) {
         unsafe {
-            let a = &mut *p;
-            a.hits = a.hits.wrapping_add(1);
+            (*p).hits = (*p).hits.wrapping_add(1);
+        }
+    }
+    if let Some(g) = FUNC_HZ_GAP.get_ptr_mut(0) {
+        unsafe {
+            let a = &mut *g;
             if a.last_ts_ns != 0 {
                 let gap = now.saturating_sub(a.last_ts_ns);
                 if gap > a.max_gap_ns {
