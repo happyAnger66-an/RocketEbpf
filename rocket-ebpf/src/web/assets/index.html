@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RocketEbpf Dashboard</title>
+<script src="/chart.js"></script>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, monospace; background: #0d1117; color: #c9d1d9; }
+header { background: #161b22; border-bottom: 1px solid #30363d; padding: 12px 24px; display: flex; align-items: center; gap: 12px; }
+header h1 { font-size: 18px; color: #58a6ff; }
+#status { font-size: 12px; padding: 3px 8px; border-radius: 10px; }
+.connected { background: #238636; color: #fff; }
+.disconnected { background: #da3633; color: #fff; }
+main { padding: 24px; max-width: 1200px; margin: 0 auto; }
+.card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+.card h2 { font-size: 14px; color: #8b949e; margin-bottom: 12px; text-transform: uppercase; letter-spacing: 1px; }
+.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-bottom: 16px; }
+.stat { background: #0d1117; border-radius: 6px; padding: 12px; }
+.stat .label { font-size: 11px; color: #8b949e; margin-bottom: 4px; }
+.stat .value { font-size: 22px; font-weight: 600; color: #58a6ff; }
+.chart-container { position: relative; height: 300px; }
+.target-info { background: #0d1117; border: 1px solid #30363d; border-radius: 6px; padding: 10px 14px; margin-bottom: 16px; font-size: 13px; color: #c9d1d9; display: flex; gap: 20px; flex-wrap: wrap; }
+.target-info .ti-label { color: #8b949e; margin-right: 4px; }
+.target-info .ti-value { color: #58a6ff; font-weight: 600; word-break: break-all; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th, td { padding: 6px 10px; text-align: left; border-bottom: 1px solid #21262d; }
+th { color: #8b949e; font-weight: 600; position: sticky; top: 0; background: #161b22; }
+.event-table-wrap { max-height: 400px; overflow-y: auto; }
+#waiting { text-align: center; padding: 80px 20px; color: #8b949e; font-size: 16px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>RocketEbpf</h1>
+  <span id="status" class="disconnected">Disconnected</span>
+  <span id="cmd-type" style="font-size:13px; color:#8b949e;"></span>
+</header>
+<main>
+  <div id="waiting">Waiting for data...</div>
+
+  <!-- func hz -->
+  <div id="panel-FuncHz" style="display:none;">
+    <div class="target-info">
+      <span><span class="ti-label">Library:</span><span class="ti-value" id="hz-lib">-</span></span>
+      <span><span class="ti-label">Symbol:</span><span class="ti-value" id="hz-sym">-</span></span>
+    </div>
+    <div class="card">
+      <h2>func hz - Overview</h2>
+      <div class="stats">
+        <div class="stat"><div class="label">Total Hits</div><div class="value" id="hz-total">0</div></div>
+        <div class="stat"><div class="label">Interval Delta</div><div class="value" id="hz-delta">0</div></div>
+        <div class="stat"><div class="label">Max Gap (ms)</div><div class="value" id="hz-gap">0</div></div>
+      </div>
+    </div>
+    <div class="card">
+      <h2>Hits Delta (time series)</h2>
+      <div class="chart-container"><canvas id="hz-chart-delta"></canvas></div>
+    </div>
+    <div class="card">
+      <h2>Max Gap ms (time series)</h2>
+      <div class="chart-container"><canvas id="hz-chart-gap"></canvas></div>
+    </div>
+  </div>
+
+  <!-- func latency -->
+  <div id="panel-FuncLatency" style="display:none;">
+    <div class="target-info">
+      <span><span class="ti-label">Library:</span><span class="ti-value" id="lat-lib">-</span></span>
+      <span><span class="ti-label">Symbol:</span><span class="ti-value" id="lat-sym">-</span></span>
+    </div>
+    <div class="card">
+      <h2>func latency - Overview</h2>
+      <div class="stats">
+        <div class="stat"><div class="label">Total Calls</div><div class="value" id="lat-calls">0</div></div>
+        <div class="stat"><div class="label">Avg (ns)</div><div class="value" id="lat-avg">0</div></div>
+        <div class="stat"><div class="label">Interval Avg (ns)</div><div class="value" id="lat-iavg">0</div></div>
+        <div class="stat"><div class="label">Interval Min (ns)</div><div class="value" id="lat-imin">n/a</div></div>
+        <div class="stat"><div class="label">Interval Max (ns)</div><div class="value" id="lat-imax">n/a</div></div>
+      </div>
+    </div>
+    <div class="card">
+      <h2>Latency (time series, ns)</h2>
+      <div class="chart-container"><canvas id="lat-chart"></canvas></div>
+    </div>
+  </div>
+
+  <!-- sched latency -->
+  <div id="panel-SchedLatency" style="display:none;">
+    <div class="card">
+      <h2>sched latency - Overview</h2>
+      <div class="stats">
+        <div class="stat"><div class="label">Events Received</div><div class="value" id="sched-count">0</div></div>
+        <div class="stat"><div class="label">Max Latency (ms)</div><div class="value" id="sched-max">0</div></div>
+        <div class="stat"><div class="label">Last Latency (ms)</div><div class="value" id="sched-last">0</div></div>
+      </div>
+    </div>
+    <div class="card">
+      <h2>Latency Distribution (ms)</h2>
+      <div class="chart-container"><canvas id="sched-chart-hist"></canvas></div>
+    </div>
+    <div class="card">
+      <h2>Recent Events</h2>
+      <div class="event-table-wrap">
+        <table>
+          <thead><tr><th>Time</th><th>TID</th><th>CPU</th><th>Latency (ms)</th><th>Prev TID</th><th>Prev Comm</th></tr></thead>
+          <tbody id="sched-tbody"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</main>
+
+<script>
+const MAX_POINTS = 200;
+const MAX_TABLE_ROWS = 200;
+let detectedType = null;
+
+// Chart defaults
+Chart.defaults.color = '#8b949e';
+Chart.defaults.borderColor = '#21262d';
+Chart.defaults.font.family = 'monospace';
+
+// ---- func hz charts ----
+const hzDeltaCtx = document.getElementById('hz-chart-delta');
+const hzGapCtx = document.getElementById('hz-chart-gap');
+let hzDeltaChart, hzGapChart;
+
+function initHzCharts() {
+  hzDeltaChart = new Chart(hzDeltaCtx, {
+    type: 'line',
+    data: { labels: [], datasets: [{ label: 'delta', data: [], borderColor: '#58a6ff', borderWidth: 2, pointRadius: 0, fill: false, tension: 0.2 }] },
+    options: { responsive: true, maintainAspectRatio: false, animation: false, scales: { y: { beginAtZero: true } } }
+  });
+  hzGapChart = new Chart(hzGapCtx, {
+    type: 'line',
+    data: { labels: [], datasets: [{ label: 'max_gap_ms', data: [], borderColor: '#f0883e', borderWidth: 2, pointRadius: 0, fill: false, tension: 0.2 }] },
+    options: { responsive: true, maintainAspectRatio: false, animation: false, scales: { y: { beginAtZero: true } } }
+  });
+}
+
+function pushHzData(ev) {
+  if (ev.library) document.getElementById('hz-lib').textContent = ev.library;
+  if (ev.symbol) document.getElementById('hz-sym').textContent = ev.symbol;
+  document.getElementById('hz-total').textContent = ev.hits;
+  document.getElementById('hz-delta').textContent = ev.delta;
+  document.getElementById('hz-gap').textContent = ev.max_gap_ms.toFixed(3);
+
+  pushChartPoint(hzDeltaChart, ev.ts, ev.delta);
+  pushChartPoint(hzGapChart, ev.ts, ev.max_gap_ms);
+}
+
+// ---- func latency chart ----
+const latCtx = document.getElementById('lat-chart');
+let latChart;
+
+function initLatChart() {
+  latChart = new Chart(latCtx, {
+    type: 'line',
+    data: {
+      labels: [],
+      datasets: [
+        { label: 'interval_avg_ns', data: [], borderColor: '#58a6ff', borderWidth: 2, pointRadius: 0, fill: false, tension: 0.2 },
+        { label: 'interval_min_ns', data: [], borderColor: '#3fb950', borderWidth: 1, pointRadius: 0, fill: false, tension: 0.2, borderDash: [4,2] },
+        { label: 'interval_max_ns', data: [], borderColor: '#da3633', borderWidth: 1, pointRadius: 0, fill: false, tension: 0.2, borderDash: [4,2] },
+      ]
+    },
+    options: { responsive: true, maintainAspectRatio: false, animation: false, scales: { y: { beginAtZero: true } } }
+  });
+}
+
+function pushLatData(ev) {
+  if (ev.library) document.getElementById('lat-lib').textContent = ev.library;
+  if (ev.symbol) document.getElementById('lat-sym').textContent = ev.symbol;
+  document.getElementById('lat-calls').textContent = ev.calls;
+  document.getElementById('lat-avg').textContent = ev.avg_ns;
+  document.getElementById('lat-iavg').textContent = ev.interval_avg_ns;
+  document.getElementById('lat-imin').textContent = ev.interval_min_ns !== null ? ev.interval_min_ns : 'n/a';
+  document.getElementById('lat-imax').textContent = ev.interval_max_ns !== null ? ev.interval_max_ns : 'n/a';
+
+  pushChartPoint(latChart, ev.ts, ev.interval_avg_ns, 0);
+  pushChartPoint(latChart, null, ev.interval_min_ns, 1);
+  pushChartPoint(latChart, null, ev.interval_max_ns, 2);
+  latChart.update();
+}
+
+// ---- sched latency ----
+let schedCount = 0;
+let schedMax = 0;
+const schedHistBuckets = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000];
+const schedHistCounts = new Array(schedHistBuckets.length + 1).fill(0);
+const schedHistCtx = document.getElementById('sched-chart-hist');
+let schedHistChart;
+
+function initSchedChart() {
+  const labels = schedHistBuckets.map((b, i) => i === 0 ? `<${b}` : `${schedHistBuckets[i-1]}-${b}`);
+  labels.push(`>${schedHistBuckets[schedHistBuckets.length-1]}`);
+  schedHistChart = new Chart(schedHistCtx, {
+    type: 'bar',
+    data: {
+      labels: labels,
+      datasets: [{ label: 'count', data: [...schedHistCounts], backgroundColor: '#58a6ff' }]
+    },
+    options: { responsive: true, maintainAspectRatio: false, animation: false, scales: { y: { beginAtZero: true } } }
+  });
+}
+
+function pushSchedData(ev) {
+  schedCount++;
+  if (ev.latency_ms > schedMax) schedMax = ev.latency_ms;
+  document.getElementById('sched-count').textContent = schedCount;
+  document.getElementById('sched-max').textContent = schedMax.toFixed(3);
+  document.getElementById('sched-last').textContent = ev.latency_ms.toFixed(3);
+
+  // histogram bucket
+  let idx = schedHistBuckets.findIndex(b => ev.latency_ms < b);
+  if (idx === -1) idx = schedHistBuckets.length;
+  schedHistCounts[idx]++;
+  schedHistChart.data.datasets[0].data = [...schedHistCounts];
+  schedHistChart.update();
+
+  // table row
+  const tbody = document.getElementById('sched-tbody');
+  const tr = document.createElement('tr');
+  tr.innerHTML = `<td>${ev.wall_local}</td><td>${ev.tid}</td><td>${ev.cpu}</td><td>${ev.latency_ms.toFixed(3)}</td><td>${ev.prev_tid !== null ? ev.prev_tid : '-'}</td><td>${ev.prev_comm || '-'}</td>`;
+  tbody.insertBefore(tr, tbody.firstChild);
+  while (tbody.children.length > MAX_TABLE_ROWS) tbody.removeChild(tbody.lastChild);
+}
+
+// ---- helpers ----
+function pushChartPoint(chart, label, value, dsIdx) {
+  dsIdx = dsIdx || 0;
+  if (label !== null) chart.data.labels.push(label);
+  chart.data.datasets[dsIdx].data.push(value);
+  if (chart.data.labels.length > MAX_POINTS) {
+    chart.data.labels.shift();
+    chart.data.datasets.forEach(ds => ds.data.shift());
+  }
+  if (dsIdx === 0 || label !== null) chart.update();
+}
+
+function showPanel(type) {
+  if (detectedType === type) return;
+  detectedType = type;
+  document.getElementById('waiting').style.display = 'none';
+  document.querySelectorAll('[id^="panel-"]').forEach(el => el.style.display = 'none');
+  const panel = document.getElementById('panel-' + type);
+  if (panel) panel.style.display = 'block';
+  document.getElementById('cmd-type').textContent = type;
+}
+
+// ---- SSE ----
+function connect() {
+  const statusEl = document.getElementById('status');
+  const es = new EventSource('/events');
+
+  es.onopen = () => { statusEl.textContent = 'Connected'; statusEl.className = 'connected'; };
+  es.onerror = () => {
+    statusEl.textContent = 'Disconnected'; statusEl.className = 'disconnected';
+    es.close();
+    setTimeout(connect, 2000);
+  };
+  es.onmessage = (msg) => {
+    let ev;
+    try { ev = JSON.parse(msg.data); } catch { return; }
+    const type = ev.type;
+
+    if (type === 'FuncHz') {
+      showPanel('FuncHz');
+      if (!hzDeltaChart) initHzCharts();
+      pushHzData(ev);
+    } else if (type === 'FuncLatency') {
+      showPanel('FuncLatency');
+      if (!latChart) initLatChart();
+      pushLatData(ev);
+    } else if (type === 'SchedLatency') {
+      showPanel('SchedLatency');
+      if (!schedHistChart) initSchedChart();
+      pushSchedData(ev);
+    }
+  };
+}
+
+connect();
+</script>
+</body>
+</html>

@@ -190,6 +190,22 @@ fn cli_sched_latency_help_mentions_pid_and_threshold() {
 }
 
 #[test]
+fn cli_web_flag_in_help() {
+    let out = Command::new(exe())
+        .arg("--help")
+        .output()
+        .expect("rocket-ebpf --help");
+    assert!(out.status.success());
+    let c = combined_output(&out.stdout, &out.stderr);
+    for needle in ["--web", "--web-port"] {
+        assert!(
+            c.contains(needle),
+            "root --help should mention {needle:?}\n{c}"
+        );
+    }
+}
+
+#[test]
 fn cli_unknown_subcommand_fails() {
     let out = Command::new(exe())
         .arg("not-a-real-subcommand-xyz")

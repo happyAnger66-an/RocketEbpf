@@ -13,6 +13,12 @@ use clap::{Parser, Subcommand};
     propagate_version = true,
 )]
 pub struct Cli {
+    /// 启用 Web 前端（HTTP + SSE 实时推送性能数据）
+    #[arg(long, default_value_t = false)]
+    pub web: bool,
+    /// Web 服务监听端口
+    #[arg(long, default_value_t = 8080)]
+    pub web_port: u16,
     #[command(subcommand)]
     pub command: Commands,
 }

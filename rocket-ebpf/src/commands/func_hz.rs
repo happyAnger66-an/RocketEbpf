@@ -22,7 +22,12 @@ struct FuncHzGlobalGapPod(FuncHzGlobalGap);
 
 unsafe impl Pod for FuncHzGlobalGapPod {}
 
-pub async fn run(ebpf: &mut Ebpf, args: FuncProbeArgs) -> anyhow::Result<()> {
+#[cfg(feature = "web")]
+type WebTx = tokio::sync::broadcast::Sender<crate::web::events::WebEvent>;
+#[cfg(not(feature = "web"))]
+type WebTx = ();
+
+pub async fn run(ebpf: &mut Ebpf, args: FuncProbeArgs, web_tx: Option<WebTx>) -> anyhow::Result<()> {
     let FuncProbeArgs {
         library,
         symbol,
@@ -100,6 +105,20 @@ pub async fn run(ebpf: &mut Ebpf, args: FuncProbeArgs) -> anyhow::Result<()> {
                 let delta = total.saturating_sub(prev_total);
                 prev_total = total;
                 println!("hits={total} (+{delta}) max_gap_ms={max_gap_ms:.3}");
+
+                #[cfg(feature = "web")]
+                if let Some(tx) = &web_tx {
+                    let _ = tx.send(crate::web::events::WebEvent::FuncHz {
+                        ts: chrono::Local::now().format("%H:%M:%S").to_string(),
+                        library: library.display().to_string(),
+                        symbol: attach_symbol.clone(),
+                        hits: total,
+                        delta,
+                        max_gap_ms,
+                    });
+                }
+                #[cfg(not(feature = "web"))]
+                let _ = &web_tx;
 
                 // 否则 max_gap_ns 会一直保持历史峰值；保留 last_ts_ns，仅清零本周期峰值。
                 g.0.max_gap_ns = 0;

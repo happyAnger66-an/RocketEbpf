@@ -8,7 +8,7 @@ use std::{
 };
 
 use anyhow::Context as _;
-use chrono::{DateTime, Local, TimeZone};
+use chrono::{DateTime, Local};
 use aya::maps::{Array, HashMap, MapData, RingBuf};
 use aya::programs::TracePoint;
 use aya::Pod;
@@ -132,7 +132,12 @@ fn format_task_comm(raw: &[u8; 16]) -> String {
     String::from_utf8_lossy(&raw[..end]).into_owned()
 }
 
-pub async fn run(ebpf: &mut Ebpf, args: SchedLatencyArgs) -> anyhow::Result<()> {
+#[cfg(feature = "web")]
+type WebTx = tokio::sync::broadcast::Sender<crate::web::events::WebEvent>;
+#[cfg(not(feature = "web"))]
+type WebTx = ();
+
+pub async fn run(ebpf: &mut Ebpf, args: SchedLatencyArgs, web_tx: Option<WebTx>) -> anyhow::Result<()> {
     let SchedLatencyArgs {
         pid,
         threshold_ms,
@@ -241,13 +246,39 @@ pub async fn run(ebpf: &mut Ebpf, args: SchedLatencyArgs) -> anyhow::Result<()> 
                             ev.cpu,
                             ev.prev_tid,
                         );
+
+                        #[cfg(feature = "web")]
+                        if let Some(tx) = &web_tx {
+                            let _ = tx.send(crate::web::events::WebEvent::SchedLatency {
+                                wall_local: wall_local.clone(),
+                                tid: ev.tid,
+                                cpu: ev.cpu,
+                                latency_ms: lat_ms,
+                                prev_tid: Some(ev.prev_tid),
+                                prev_comm: Some(prev_comm),
+                            });
+                        }
                     } else {
                         println!(
                             "wall_local={wall_local} tid={} cpu={} latency_ms={lat_ms:.3}",
                             ev.tid,
                             ev.cpu,
                         );
+
+                        #[cfg(feature = "web")]
+                        if let Some(tx) = &web_tx {
+                            let _ = tx.send(crate::web::events::WebEvent::SchedLatency {
+                                wall_local: wall_local.clone(),
+                                tid: ev.tid,
+                                cpu: ev.cpu,
+                                latency_ms: lat_ms,
+                                prev_tid: None,
+                                prev_comm: None,
+                            });
+                        }
                     }
+                    #[cfg(not(feature = "web"))]
+                    let _ = &web_tx;
                 }
             }
         }

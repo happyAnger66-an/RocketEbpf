@@ -18,7 +18,12 @@ struct FuncLatencyAggPod(FuncLatencyAgg);
 
 unsafe impl Pod for FuncLatencyAggPod {}
 
-pub async fn run(ebpf: &mut Ebpf, args: FuncProbeArgs) -> anyhow::Result<()> {
+#[cfg(feature = "web")]
+type WebTx = tokio::sync::broadcast::Sender<crate::web::events::WebEvent>;
+#[cfg(not(feature = "web"))]
+type WebTx = ();
+
+pub async fn run(ebpf: &mut Ebpf, args: FuncProbeArgs, web_tx: Option<WebTx>) -> anyhow::Result<()> {
     let FuncProbeArgs {
         library,
         symbol,
@@ -161,6 +166,23 @@ pub async fn run(ebpf: &mut Ebpf, args: FuncProbeArgs) -> anyhow::Result<()> {
                         );
                     }
                 }
+
+                #[cfg(feature = "web")]
+                if let Some(tx) = &web_tx {
+                    let _ = tx.send(crate::web::events::WebEvent::FuncLatency {
+                        ts: chrono::Local::now().format("%H:%M:%S").to_string(),
+                        library: library.display().to_string(),
+                        symbol: attach_symbol.clone(),
+                        calls: cum_calls,
+                        delta: iv_calls,
+                        avg_ns: cum_avg_ns,
+                        interval_avg_ns,
+                        interval_min_ns: iv_min_ns,
+                        interval_max_ns: iv_max_ns,
+                    });
+                }
+                #[cfg(not(feature = "web"))]
+                let _ = &web_tx;
             }
         }
     }

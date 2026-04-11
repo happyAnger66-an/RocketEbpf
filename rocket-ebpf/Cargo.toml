@@ -9,6 +9,7 @@ rocket-ebpf-common = { path = "../rocket-ebpf-common" }
 
 anyhow = { workspace = true, default-features = true }
 aya = { workspace = true }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"], optional = true }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 cpp_demangle = "0.4"
 clap = { workspace = true }
@@ -21,6 +22,8 @@ aya-log = { workspace = true }
 env_logger = { workspace = true }
 libc = { workspace = true }
 log = { workspace = true }
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
 tokio = { workspace = true, features = [
     "macros",
     "rt",
@@ -28,6 +31,7 @@ tokio = { workspace = true, features = [
     "signal",
     "time",
 ] }
+tokio-stream = { version = "0.1", features = ["sync"], optional = true }
 
 [build-dependencies]
 anyhow = { workspace = true }
@@ -37,6 +41,10 @@ rocket-ebpf-ebpf = { path = "../rocket-ebpf-ebpf" }
 
 [dev-dependencies]
 libc = { workspace = true }
+
+[features]
+default = ["web"]
+web = ["dep:axum", "dep:tokio-stream", "dep:serde", "dep:serde_json"]
 
 [[bin]]
 name = "rocket-ebpf"
