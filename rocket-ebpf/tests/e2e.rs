@@ -13,9 +13,9 @@ fn exe() -> &'static str {
     env!("CARGO_BIN_EXE_rocket-ebpf")
 }
 
-fn temp_config_path(name: &str) -> PathBuf {
+fn temp_config_path(name: &str, ext: &str) -> PathBuf {
     let unique = format!(
-        "rocket-ebpf-{name}-{}-{}.json",
+        "rocket-ebpf-{name}-{}-{}.{ext}",
         std::process::id(),
         Instant::now().elapsed().as_nanos()
     );
@@ -151,7 +151,7 @@ fn cli_subcommand_help_smoke() {
 
 #[test]
 fn cli_server_check_accepts_valid_config() {
-    let path = temp_config_path("server-ok");
+    let path = temp_config_path("server-ok", "json");
     fs::write(
         &path,
         r#"
@@ -201,7 +201,7 @@ fn cli_server_check_accepts_valid_config() {
 
 #[test]
 fn cli_server_check_rejects_bad_output_reference() {
-    let path = temp_config_path("server-bad-output");
+    let path = temp_config_path("server-bad-output", "json");
     fs::write(
         &path,
         r#"
@@ -242,6 +242,211 @@ fn cli_server_check_rejects_bad_output_reference() {
     assert!(
         combined.contains("未启用或未知的输出方向"),
         "error should mention output validation:\n{combined}"
+    );
+}
+
+#[test]
+fn cli_server_check_rejects_duplicate_monitor_type() {
+    let path = temp_config_path("server-dup-type", "yaml");
+    fs::write(
+        &path,
+        r#"
+outputs:
+  console:
+    enabled: true
+monitors:
+  - type: func_hz
+    name: hz-a
+    enabled: true
+    library: /usr/lib/x86_64-linux-gnu/libc.so.6
+    symbol: malloc
+    interval_secs: 1
+    outputs: [console]
+  - type: func_hz
+    name: hz-b
+    enabled: true
+    library: /usr/lib/x86_64-linux-gnu/libc.so.6
+    symbol: free
+    interval_secs: 1
+    outputs: [console]
+"#,
+    )
+    .expect("write yaml config");
+
+    let out = Command::new(exe())
+        .args(["server", "--config"])
+        .arg(&path)
+        .arg("--check")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("server --check duplicate type");
+
+    let _ = fs::remove_file(&path);
+    let combined = combined_output(&out.stdout, &out.stderr);
+    assert!(
+        !out.status.success(),
+        "duplicate monitor type should fail: {combined}"
+    );
+    assert!(
+        combined.contains("不能同时启用多个 func_hz monitor"),
+        "error should mention duplicate type:\n{combined}"
+    );
+}
+
+fn repo_config(relative: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(relative)
+}
+
+#[test]
+fn cli_server_check_accepts_example_yaml() {
+    let path = repo_config("../configs/server.example.yaml");
+    let out = Command::new(exe())
+        .args(["server", "--config"])
+        .arg(&path)
+        .arg("--check")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("server --check example yaml");
+
+    let combined = combined_output(&out.stdout, &out.stderr);
+    assert!(
+        out.status.success(),
+        "example yaml should pass --check: {combined}"
+    );
+    assert!(
+        combined.contains("server config ok"),
+        "server --check should report ok:\n{combined}"
+    );
+}
+
+#[test]
+fn cli_server_check_accepts_yaml_with_comments() {
+    let path = temp_config_path("server-yaml-comments", "yaml");
+    fs::write(
+        &path,
+        r#"# header comment
+outputs:
+  console:
+    enabled: true
+monitors:
+  - type: func_hz
+    name: hz-with-comment
+    enabled: true
+    library: /usr/lib/x86_64-linux-gnu/libc.so.6
+    symbol: malloc
+    interval_secs: 1
+    outputs: [console]
+    thresholds:
+      min_delta: 1
+"#,
+    )
+    .expect("write yaml config");
+
+    let out = Command::new(exe())
+        .args(["server", "--config"])
+        .arg(&path)
+        .arg("--check")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("server --check yaml comments");
+
+    let _ = fs::remove_file(&path);
+    let combined = combined_output(&out.stdout, &out.stderr);
+    assert!(
+        out.status.success(),
+        "yaml with comments should pass: {combined}"
+    );
+}
+
+#[test]
+fn cli_server_check_accepts_sched_latency_float_threshold() {
+    let path = temp_config_path("server-sched-float-threshold", "yaml");
+    fs::write(
+        &path,
+        r#"
+outputs:
+  console:
+    enabled: true
+monitors:
+  - type: sched_latency
+    name: sched-float
+    enabled: true
+    pid: 1
+    threshold_ms: 0.001
+    outputs: [console]
+"#,
+    )
+    .expect("write yaml config");
+
+    let out = Command::new(exe())
+        .args(["server", "--config"])
+        .arg(&path)
+        .arg("--check")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("server --check float threshold");
+
+    let _ = fs::remove_file(&path);
+    let combined = combined_output(&out.stdout, &out.stderr);
+    assert!(
+        out.status.success(),
+        "float threshold_ms should pass --check: {combined}"
+    );
+}
+
+#[test]
+fn cli_server_check_accepts_example_json() {
+    let path = repo_config("../configs/server.example.json");
+    let out = Command::new(exe())
+        .args(["server", "--config"])
+        .arg(&path)
+        .arg("--check")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("server --check example json");
+
+    let combined = combined_output(&out.stdout, &out.stderr);
+    assert!(
+        out.status.success(),
+        "example json should pass --check: {combined}"
+    );
+}
+
+#[test]
+fn cli_server_check_rejects_unsupported_extension() {
+    let path = temp_config_path("server-bad-ext", "toml");
+    fs::write(
+        &path,
+        r#"
+[outputs]
+console = { enabled = true }
+"#,
+    )
+    .expect("write toml config");
+
+    let out = Command::new(exe())
+        .args(["server", "--config"])
+        .arg(&path)
+        .arg("--check")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("server --check bad ext");
+
+    let _ = fs::remove_file(&path);
+    let combined = combined_output(&out.stdout, &out.stderr);
+    assert!(
+        !out.status.success(),
+        "unsupported extension should fail: {combined}"
+    );
+    assert!(
+        combined.contains("不支持的配置文件格式"),
+        "error should mention unsupported format:\n{combined}"
     );
 }
 

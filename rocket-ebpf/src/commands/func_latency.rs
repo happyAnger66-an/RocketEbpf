@@ -174,6 +174,7 @@ pub async fn run(
                 #[cfg(feature = "web")]
                 if let Some(tx) = &web_tx {
                     let _ = tx.send(crate::web::events::WebEvent::FuncLatency {
+                        monitor: attach_symbol.clone(),
                         ts: chrono::Local::now().format("%H:%M:%S").to_string(),
                         library: library.display().to_string(),
                         symbol: attach_symbol.clone(),

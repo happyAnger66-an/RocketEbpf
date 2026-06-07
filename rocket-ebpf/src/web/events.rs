@@ -5,6 +5,7 @@ use serde::Serialize;
 #[serde(tag = "type")]
 pub enum WebEvent {
     FuncHz {
+        monitor: String,
         ts: String,
         library: String,
         symbol: String,
@@ -13,6 +14,7 @@ pub enum WebEvent {
         max_gap_ms: f64,
     },
     FuncLatency {
+        monitor: String,
         ts: String,
         library: String,
         symbol: String,
@@ -24,6 +26,7 @@ pub enum WebEvent {
         interval_max_ns: Option<u64>,
     },
     SchedLatency {
+        monitor: String,
         wall_local: String,
         tid: u32,
         cpu: u32,

@@ -7,7 +7,7 @@
 目标是新增一个常驻进程形态，例如：
 
 ```bash
-sudo rocket-ebpf server --config /etc/rocket-ebpf/config.json
+sudo rocket-ebpf server --config /etc/rocket-ebpf/config.yaml
 ```
 
 daemon 启动后读取配置文件，按配置开启指定监控项，并根据阈值把事件输出到日志、控制台或 Web UI client。
@@ -25,7 +25,7 @@ daemon 启动后读取配置文件，按配置开启指定监控项，并根据�
 
 ```text
 rocket-ebpfd / rocket-ebpf server
-  -> 读取 config.json
+  -> 读取 config.yaml / config.json
   -> 加载 eBPF object
   -> MonitorManager 启动多个 monitor task
       -> sched latency monitor
@@ -52,64 +52,55 @@ rocket-ebpfd / rocket-ebpf server
 
 ## 配置文件草案
 
-第一阶段实现先使用 JSON 配置，避免在当前离线/代理受限环境中引入新的 YAML 解析依赖。后续如果允许新增依赖，可再切换到 YAML 或同时支持 YAML/TOML。
+配置文件推荐使用 **YAML**（支持注释）；也兼容 **JSON**。示例见 [`configs/server.example.yaml`](../configs/server.example.yaml)。
 
-```json
-{
-  "server": {
-    "web": {
-      "enabled": true,
-      "listen": "0.0.0.0:8080"
-    }
-  },
-  "outputs": {
-    "console": { "enabled": true },
-    "log": {
-      "enabled": true,
-      "path": "/var/log/rocket-ebpf/events.jsonl"
-    },
-    "web": { "enabled": true }
-  },
-  "monitors": [
-    {
-      "name": "nginx-sched-latency",
-      "type": "sched_latency",
-      "enabled": true,
-      "pid": 1234,
-      "threshold_ms": 5,
-      "include_prev": true,
-      "outputs": ["console", "log", "web"]
-    },
-    {
-      "name": "malloc-latency",
-      "type": "func_latency",
-      "enabled": true,
-      "library": "/usr/lib/x86_64-linux-gnu/libc.so.6",
-      "symbol": "malloc",
-      "pid": 1234,
-      "interval_secs": 1,
-      "thresholds": {
-        "interval_avg_ns": 1000000,
-        "interval_max_ns": 5000000
-      },
-      "outputs": ["log", "web"]
-    },
-    {
-      "name": "malloc-hz",
-      "type": "func_hz",
-      "enabled": true,
-      "library": "/usr/lib/x86_64-linux-gnu/libc.so.6",
-      "symbol": "malloc",
-      "pid": 1234,
-      "interval_secs": 1,
-      "thresholds": {
-        "min_delta": 1000,
-        "max_gap_ms": 100
-      },
-      "outputs": ["console", "web"]
-    }
-  ]
-}
+```yaml
+server:
+  web:
+    enabled: true
+    listen: "0.0.0.0:8080"
+
+outputs:
+  console:
+    enabled: true
+  log:
+    enabled: true
+    path: "/var/log/rocket-ebpf/events.jsonl"
+  web:
+    enabled: true
+
+monitors:
+  - name: nginx-sched-latency
+    type: sched_latency
+    enabled: true
+    pid: 1234
+    threshold_ms: 5
+    include_prev: true
+    outputs: [console, log, web]
+
+  - name: malloc-latency
+    type: func_latency
+    enabled: true
+    library: "/usr/lib/x86_64-linux-gnu/libc.so.6"
+    symbol: malloc
+    pid: 1234
+    interval_secs: 1
+    thresholds:
+      interval_avg_ns: 1000000
+      interval_max_ns: 5000000
+    outputs: [log, web]
+
+  - name: malloc-hz
+    type: func_hz
+    enabled: true
+    library: "/usr/lib/x86_64-linux-gnu/libc.so.6"
+    symbol: malloc
+    pid: 1234
+    interval_secs: 1
+    thresholds:
+      min_delta: 1000
+      max_gap_ms: 100
+    outputs: [console, web]
 ```
 
 Rust 侧可以建模为：
@@ -292,7 +283,7 @@ trait Sink {
 目标：跑通 server 形态，尽量复用现有实现。
 
 - 新增 `server --config <path>` 子命令。
-- 增加 `config.rs`，支持读取 JSON 配置。
+- 增加 `config.rs`，支持读取 YAML / JSON 配置（按扩展名自动选择解析器）。
 - 增加 `server.rs`，负责加载配置、启动 Web、启动 monitor。
 - 增加基础 `MonitorEvent`。
 - 支持 `sched_latency`、单个 `func_hz`、单个 `func_latency`。

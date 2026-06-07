@@ -107,20 +107,21 @@ pub async fn run(args: ServerArgs) -> anyhow::Result<()> {
     }
 
     let runtime = build_runtime(&cfg).await?;
+    let mut ebpf = crate::ebpf::load_and_init_logger()?;
+    eprintln!("已加载 eBPF 对象（各 monitor 共用一份，依次 attach）");
     let mut tasks = Vec::new();
 
-    for monitor in cfg.monitors.clone() {
+    for monitor in cfg.monitors {
         if !monitor.common().enabled {
             eprintln!("跳过未启用 monitor: {}", monitor.common().name);
             continue;
         }
         let rt = runtime.clone();
         let name = monitor.common().name.clone();
-        tasks.push(tokio::spawn(async move {
-            if let Err(e) = run_monitor(monitor, rt).await {
-                eprintln!("monitor {name} 退出: {e:#}");
-            }
-        }));
+        match spawn_monitor(monitor, &mut ebpf, rt) {
+            Ok(task) => tasks.push(task),
+            Err(e) => eprintln!("monitor {name} 启动失败: {e:#}"),
+        }
     }
 
     if tasks.is_empty() {
@@ -137,6 +138,195 @@ pub async fn run(args: ServerArgs) -> anyhow::Result<()> {
     }
     eprintln!("server 退出。");
     Ok(())
+}
+
+fn spawn_monitor(
+    monitor: MonitorConfig,
+    ebpf: &mut Ebpf,
+    runtime: ServerRuntime,
+) -> anyhow::Result<tokio::task::JoinHandle<()>> {
+    let name = monitor.common().name.clone();
+    Ok(match monitor {
+        MonitorConfig::FuncHz(cfg) => {
+            let runner = prepare_func_hz(ebpf, cfg, runtime)?;
+            tokio::spawn(async move {
+                if let Err(e) = runner.run().await {
+                    eprintln!("monitor {name} 退出: {e:#}");
+                }
+            })
+        }
+        MonitorConfig::FuncLatency(cfg) => {
+            let runner = prepare_func_latency(ebpf, cfg, runtime)?;
+            tokio::spawn(async move {
+                if let Err(e) = runner.run().await {
+                    eprintln!("monitor {name} 退出: {e:#}");
+                }
+            })
+        }
+        MonitorConfig::SchedLatency(cfg) => {
+            let runner = prepare_sched_latency(ebpf, cfg, runtime)?;
+            tokio::spawn(async move {
+                if let Err(e) = runner.run().await {
+                    eprintln!("monitor {name} 退出: {e:#}");
+                }
+            })
+        }
+    })
+}
+
+struct FuncHzRunner {
+    hits: PerCpuArray<MapData, FuncHzPerCpuPod>,
+    gap: Array<MapData, FuncHzGlobalGapPod>,
+    attach_symbol: String,
+    cfg: FuncHzConfig,
+    runtime: ServerRuntime,
+}
+
+struct FuncLatencyRunner {
+    agg: PerCpuArray<MapData, FuncLatencyAggPod>,
+    attach_symbol: String,
+    cfg: FuncLatencyConfig,
+    runtime: ServerRuntime,
+}
+
+struct SchedRunner {
+    filter: HashMap<MapData, u32, u8>,
+    ring: RingBuf<MapData>,
+    cfg: SchedLatencyConfig,
+    args: crate::cli::SchedLatencyArgs,
+    runtime: ServerRuntime,
+    calib: RealtimeCalib,
+}
+
+fn prepare_func_hz(
+    ebpf: &mut Ebpf,
+    cfg: FuncHzConfig,
+    runtime: ServerRuntime,
+) -> anyhow::Result<FuncHzRunner> {
+    let attach_symbol = attach_func_hz(ebpf, &cfg.probe)?;
+    let hits = PerCpuArray::<_, FuncHzPerCpuPod>::try_from(
+        ebpf.take_map("FUNC_HZ_STATS")
+            .context("未找到 map FUNC_HZ_STATS")?,
+    )
+    .context("打开 FUNC_HZ_STATS 失败")?;
+    let gap = Array::<_, FuncHzGlobalGapPod>::try_from(
+        ebpf.take_map("FUNC_HZ_GAP")
+            .context("未找到 map FUNC_HZ_GAP")?,
+    )
+    .context("打开 FUNC_HZ_GAP 失败")?;
+
+    eprintln!(
+        "monitor={} 已启动 func_hz：library={} symbol={attach_symbol}",
+        cfg.common.name,
+        cfg.probe.library.display()
+    );
+
+    Ok(FuncHzRunner {
+        hits,
+        gap,
+        attach_symbol,
+        cfg,
+        runtime,
+    })
+}
+
+fn prepare_func_latency(
+    ebpf: &mut Ebpf,
+    cfg: FuncLatencyConfig,
+    runtime: ServerRuntime,
+) -> anyhow::Result<FuncLatencyRunner> {
+    let attach_symbol = attach_func_latency(ebpf, &cfg.probe)?;
+    let agg = PerCpuArray::<_, FuncLatencyAggPod>::try_from(
+        ebpf.take_map("FUNC_LAT_AGG")
+            .context("未找到 map FUNC_LAT_AGG")?,
+    )
+    .context("打开 FUNC_LAT_AGG 失败")?;
+
+    eprintln!(
+        "monitor={} 已启动 func_latency：library={} symbol={attach_symbol}",
+        cfg.common.name,
+        cfg.probe.library.display()
+    );
+
+    Ok(FuncLatencyRunner {
+        agg,
+        attach_symbol,
+        cfg,
+        runtime,
+    })
+}
+
+fn prepare_sched_latency(
+    ebpf: &mut Ebpf,
+    cfg: SchedLatencyConfig,
+    runtime: ServerRuntime,
+) -> anyhow::Result<SchedRunner> {
+    let args = crate::cli::SchedLatencyArgs {
+        pid: cfg.pid,
+        threshold_ms: cfg.threshold_ms,
+        task_refresh_secs: cfg.task_refresh_secs,
+        prev: cfg.include_prev,
+    };
+    let filter = attach_sched_latency(ebpf, &args)?;
+    let ring = RingBuf::try_from(
+        ebpf.take_map("SCHED_LAT_EVENTS")
+            .context("未找到 map SCHED_LAT_EVENTS")?,
+    )
+    .context("打开 SCHED_LAT_EVENTS 失败")?;
+    let calib = RealtimeCalib::snap().context("校准 CLOCK_REALTIME / CLOCK_MONOTONIC")?;
+
+    eprintln!(
+        "monitor={} 已启动 sched_latency：pid={} threshold_ms={:.6}",
+        cfg.common.name, cfg.pid, cfg.threshold_ms
+    );
+
+    Ok(SchedRunner {
+        filter,
+        ring,
+        cfg,
+        args,
+        runtime,
+        calib,
+    })
+}
+
+impl FuncHzRunner {
+    async fn run(mut self) -> anyhow::Result<()> {
+        run_func_hz_loop(
+            &mut self.hits,
+            &mut self.gap,
+            &self.attach_symbol,
+            &self.cfg,
+            &self.runtime,
+        )
+        .await
+    }
+}
+
+impl FuncLatencyRunner {
+    async fn run(self) -> anyhow::Result<()> {
+        run_func_latency_loop(
+            self.agg,
+            &self.attach_symbol,
+            &self.cfg,
+            &self.runtime,
+        )
+        .await
+    }
+}
+
+impl SchedRunner {
+    async fn run(mut self) -> anyhow::Result<()> {
+        run_sched_latency_loop(
+            &mut self.filter,
+            &mut self.ring,
+            &self.cfg,
+            &self.args,
+            &self.runtime,
+            self.calib,
+        )
+        .await
+    }
 }
 
 async fn build_runtime(cfg: &ServerConfig) -> anyhow::Result<ServerRuntime> {
@@ -178,28 +368,19 @@ async fn build_runtime(cfg: &ServerConfig) -> anyhow::Result<ServerRuntime> {
     })
 }
 
-async fn run_monitor(monitor: MonitorConfig, runtime: ServerRuntime) -> anyhow::Result<()> {
-    let mut ebpf = crate::ebpf::load_and_init_logger()?;
-    match monitor {
-        MonitorConfig::FuncHz(cfg) => run_func_hz(&mut ebpf, cfg, runtime).await,
-        MonitorConfig::FuncLatency(cfg) => run_func_latency(&mut ebpf, cfg, runtime).await,
-        MonitorConfig::SchedLatency(cfg) => run_sched_latency(&mut ebpf, cfg, runtime).await,
-    }
-}
-
 fn should_send(output: &str, outputs: &[String]) -> bool {
     outputs.iter().any(|item| item == output)
 }
 
-fn emit_alert(runtime: &ServerRuntime, outputs: &[String], alert: AlertEvent) {
-    if should_send("console", outputs) && runtime.outputs.console.enabled {
-        println!("{}", format_alert(&alert));
+fn emit_event(runtime: &ServerRuntime, outputs: &[String], event: AlertEvent, threshold_met: bool) {
+    if threshold_met && should_send("console", outputs) && runtime.outputs.console.enabled {
+        println!("{}", format_alert(&event));
     }
 
-    if should_send("log", outputs) && runtime.outputs.log.enabled {
+    if threshold_met && should_send("log", outputs) && runtime.outputs.log.enabled {
         if let Some(file) = &runtime.log_file {
             if let Ok(mut file) = file.lock() {
-                if let Ok(line) = serde_json::to_string(&alert) {
+                if let Ok(line) = serde_json::to_string(&event) {
                     let _ = writeln!(file, "{line}");
                 }
             }
@@ -209,12 +390,12 @@ fn emit_alert(runtime: &ServerRuntime, outputs: &[String], alert: AlertEvent) {
     #[cfg(feature = "web")]
     if should_send("web", outputs) && runtime.outputs.web.enabled {
         if let Some(tx) = &runtime.web_tx {
-            let _ = tx.send(to_web_event(&alert));
+            let _ = tx.send(to_web_event(&event));
         }
     }
 
     #[cfg(not(feature = "web"))]
-    let _ = &alert;
+    let _ = (&event, threshold_met);
 }
 
 fn format_alert(alert: &AlertEvent) -> String {
@@ -274,6 +455,7 @@ fn opt_u64(v: Option<u64>) -> String {
 fn to_web_event(alert: &AlertEvent) -> crate::web::events::WebEvent {
     match alert {
         AlertEvent::FuncHz {
+            monitor,
             ts,
             library,
             symbol,
@@ -282,6 +464,7 @@ fn to_web_event(alert: &AlertEvent) -> crate::web::events::WebEvent {
             max_gap_ms,
             ..
         } => crate::web::events::WebEvent::FuncHz {
+            monitor: monitor.clone(),
             ts: ts.clone(),
             library: library.clone(),
             symbol: symbol.clone(),
@@ -290,6 +473,7 @@ fn to_web_event(alert: &AlertEvent) -> crate::web::events::WebEvent {
             max_gap_ms: *max_gap_ms,
         },
         AlertEvent::FuncLatency {
+            monitor,
             ts,
             library,
             symbol,
@@ -301,6 +485,7 @@ fn to_web_event(alert: &AlertEvent) -> crate::web::events::WebEvent {
             interval_max_ns,
             ..
         } => crate::web::events::WebEvent::FuncLatency {
+            monitor: monitor.clone(),
             ts: ts.clone(),
             library: library.clone(),
             symbol: symbol.clone(),
@@ -312,6 +497,7 @@ fn to_web_event(alert: &AlertEvent) -> crate::web::events::WebEvent {
             interval_max_ns: *interval_max_ns,
         },
         AlertEvent::SchedLatency {
+            monitor,
             wall_local,
             tid,
             cpu,
@@ -320,6 +506,7 @@ fn to_web_event(alert: &AlertEvent) -> crate::web::events::WebEvent {
             prev_comm,
             ..
         } => crate::web::events::WebEvent::SchedLatency {
+            monitor: monitor.clone(),
             wall_local: wall_local.clone(),
             tid: *tid,
             cpu: *cpu,
@@ -330,29 +517,13 @@ fn to_web_event(alert: &AlertEvent) -> crate::web::events::WebEvent {
     }
 }
 
-async fn run_func_hz(
-    ebpf: &mut Ebpf,
-    cfg: FuncHzConfig,
-    runtime: ServerRuntime,
+async fn run_func_hz_loop(
+    hits: &mut PerCpuArray<MapData, FuncHzPerCpuPod>,
+    gap: &mut Array<MapData, FuncHzGlobalGapPod>,
+    attach_symbol: &str,
+    cfg: &FuncHzConfig,
+    runtime: &ServerRuntime,
 ) -> anyhow::Result<()> {
-    let attach_symbol = attach_func_hz(ebpf, &cfg.probe)?;
-    let hits = PerCpuArray::<_, FuncHzPerCpuPod>::try_from(
-        ebpf.take_map("FUNC_HZ_STATS")
-            .context("未找到 map FUNC_HZ_STATS")?,
-    )
-    .context("打开 FUNC_HZ_STATS 失败")?;
-    let mut gap = Array::<_, FuncHzGlobalGapPod>::try_from(
-        ebpf.take_map("FUNC_HZ_GAP")
-            .context("未找到 map FUNC_HZ_GAP")?,
-    )
-    .context("打开 FUNC_HZ_GAP 失败")?;
-
-    eprintln!(
-        "monitor={} 已启动 func_hz：library={} symbol={attach_symbol}",
-        cfg.common.name,
-        cfg.probe.library.display()
-    );
-
     let mut prev_total = 0u64;
     loop {
         tokio::time::sleep(Duration::from_secs(cfg.probe.interval_secs.max(1))).await;
@@ -367,21 +538,21 @@ async fn run_func_hz(
         let delta = total.saturating_sub(prev_total);
         prev_total = total;
 
-        if func_hz_alert(&cfg, delta, max_gap_ms) {
-            emit_alert(
-                &runtime,
-                &cfg.common.outputs,
-                AlertEvent::FuncHz {
-                    ts: Local::now().format("%H:%M:%S").to_string(),
-                    monitor: cfg.common.name.clone(),
-                    library: cfg.probe.library.display().to_string(),
-                    symbol: attach_symbol.clone(),
-                    hits: total,
-                    delta,
-                    max_gap_ms,
-                },
-            );
-        }
+        let threshold_met = func_hz_alert(&cfg, delta, max_gap_ms);
+        emit_event(
+            &runtime,
+            &cfg.common.outputs,
+            AlertEvent::FuncHz {
+                ts: Local::now().format("%H:%M:%S").to_string(),
+                monitor: cfg.common.name.clone(),
+                library: cfg.probe.library.display().to_string(),
+                symbol: attach_symbol.to_string(),
+                hits: total,
+                delta,
+                max_gap_ms,
+            },
+            threshold_met,
+        );
 
         g.0.max_gap_ns = 0;
         gap.set(0, g, 0)
@@ -432,24 +603,12 @@ fn func_hz_alert(cfg: &FuncHzConfig, delta: u64, max_gap_ms: f64) -> bool {
     !has_threshold
 }
 
-async fn run_func_latency(
-    ebpf: &mut Ebpf,
-    cfg: FuncLatencyConfig,
-    runtime: ServerRuntime,
+async fn run_func_latency_loop(
+    mut agg: PerCpuArray<MapData, FuncLatencyAggPod>,
+    attach_symbol: &str,
+    cfg: &FuncLatencyConfig,
+    runtime: &ServerRuntime,
 ) -> anyhow::Result<()> {
-    let attach_symbol = attach_func_latency(ebpf, &cfg.probe)?;
-    let mut agg = PerCpuArray::<_, FuncLatencyAggPod>::try_from(
-        ebpf.map_mut("FUNC_LAT_AGG")
-            .context("未找到 map FUNC_LAT_AGG")?,
-    )
-    .context("打开 FUNC_LAT_AGG 失败")?;
-
-    eprintln!(
-        "monitor={} 已启动 func_latency：library={} symbol={attach_symbol}",
-        cfg.common.name,
-        cfg.probe.library.display()
-    );
-
     let mut cum_calls = 0u64;
     let mut cum_sum_ns = 0u64;
     let zero_pod = || {
@@ -498,24 +657,24 @@ async fn run_func_latency(
             .context("构造清零用 PerCpuValues")?;
         agg.set(0, zeros, 0).context("清零 FUNC_LAT_AGG 失败")?;
 
-        if func_latency_alert(&cfg, interval_avg_ns, iv_max_ns) {
-            emit_alert(
-                &runtime,
-                &cfg.common.outputs,
-                AlertEvent::FuncLatency {
-                    ts: Local::now().format("%H:%M:%S").to_string(),
-                    monitor: cfg.common.name.clone(),
-                    library: cfg.probe.library.display().to_string(),
-                    symbol: attach_symbol.clone(),
-                    calls: cum_calls,
-                    delta: iv_calls,
-                    avg_ns: cum_avg_ns,
-                    interval_avg_ns,
-                    interval_min_ns: iv_min_ns,
-                    interval_max_ns: iv_max_ns,
-                },
-            );
-        }
+        let threshold_met = func_latency_alert(&cfg, interval_avg_ns, iv_max_ns);
+        emit_event(
+            &runtime,
+            &cfg.common.outputs,
+            AlertEvent::FuncLatency {
+                ts: Local::now().format("%H:%M:%S").to_string(),
+                monitor: cfg.common.name.clone(),
+                library: cfg.probe.library.display().to_string(),
+                symbol: attach_symbol.to_string(),
+                calls: cum_calls,
+                delta: iv_calls,
+                avg_ns: cum_avg_ns,
+                interval_avg_ns,
+                interval_min_ns: iv_min_ns,
+                interval_max_ns: iv_max_ns,
+            },
+            threshold_met,
+        );
     }
 }
 
@@ -573,38 +732,23 @@ fn func_latency_alert(
     !has_threshold
 }
 
-async fn run_sched_latency(
-    ebpf: &mut Ebpf,
-    cfg: SchedLatencyConfig,
-    runtime: ServerRuntime,
+async fn run_sched_latency_loop(
+    filter: &mut HashMap<MapData, u32, u8>,
+    ring: &mut RingBuf<MapData>,
+    cfg: &SchedLatencyConfig,
+    args: &crate::cli::SchedLatencyArgs,
+    runtime: &ServerRuntime,
+    calib: RealtimeCalib,
 ) -> anyhow::Result<()> {
-    let args = crate::cli::SchedLatencyArgs {
-        pid: cfg.pid,
-        threshold_ms: cfg.threshold_ms,
-        task_refresh_secs: cfg.task_refresh_secs,
-        prev: cfg.include_prev,
-    };
-    let mut filter = attach_sched_latency(ebpf, &args)?;
-    let mut ring = RingBuf::try_from(
-        ebpf.take_map("SCHED_LAT_EVENTS")
-            .context("未找到 map SCHED_LAT_EVENTS")?,
-    )
-    .context("打开 SCHED_LAT_EVENTS 失败")?;
-    let calib = RealtimeCalib::snap().context("校准 CLOCK_REALTIME / CLOCK_MONOTONIC")?;
     let mut refresh = tokio::time::interval(Duration::from_secs(args.task_refresh_secs.max(1)));
     refresh.tick().await;
     let mut poll = tokio::time::interval(Duration::from_millis(50));
     poll.tick().await;
 
-    eprintln!(
-        "monitor={} 已启动 sched_latency：pid={} threshold_ms={}",
-        cfg.common.name, cfg.pid, cfg.threshold_ms
-    );
-
     loop {
         tokio::select! {
             _ = refresh.tick() => {
-                if let Err(e) = refresh_tid_filter(&mut filter, args.pid) {
+                if let Err(e) = refresh_tid_filter(filter, args.pid) {
                     eprintln!("monitor={} 刷新线程列表失败: {e:#}", cfg.common.name);
                 }
             }
@@ -621,8 +765,8 @@ async fn run_sched_latency(
                     } else {
                         (None, None)
                     };
-                    emit_alert(
-                        &runtime,
+                    emit_event(
+                        runtime,
                         &cfg.common.outputs,
                         AlertEvent::SchedLatency {
                             wall_local,
@@ -633,6 +777,7 @@ async fn run_sched_latency(
                             prev_tid,
                             prev_comm,
                         },
+                        true,
                     );
                 }
             }
@@ -644,7 +789,7 @@ fn attach_sched_latency(
     ebpf: &mut Ebpf,
     args: &crate::cli::SchedLatencyArgs,
 ) -> anyhow::Result<HashMap<MapData, u32, u8>> {
-    let threshold_ns = args.threshold_ms.saturating_mul(1_000_000);
+    let threshold_ns = crate::config::threshold_ms_to_ns(args.threshold_ms);
     {
         let mut cfg = Array::<_, SchedLatConfigPod>::try_from(
             ebpf.map_mut("SCHED_LAT_CONFIG")

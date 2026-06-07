@@ -1,3 +1,5 @@
 debug/
 target/
 **/*.rs.bk
+a.out
+1.cc

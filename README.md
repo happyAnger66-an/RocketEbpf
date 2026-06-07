@@ -17,12 +17,12 @@ sudo ./target/release/rocket-ebpf func hz /path/to/libfoo.so 'myns::Bar::run' --
 常驻监控场景可使用 **server daemon** 模式，通过配置文件一次启动多个监控项：
 
 ```bash
-# 先校验配置，不加载 eBPF
-./target/release/rocket-ebpf server --config configs/server.example.json --check
+# 先校验配置，不加载 eBPF（推荐 YAML，支持注释）
+./target/release/rocket-ebpf server --config configs/server.example.yaml --check
 
 # 复制示例后修改 pid / library / enabled 等字段，再启动常驻监控
-cp configs/server.example.json /tmp/rocket-ebpf-server.json
-sudo ./target/release/rocket-ebpf server --config /tmp/rocket-ebpf-server.json
+cp configs/server.example.yaml /tmp/rocket-ebpf-server.yaml
+sudo ./target/release/rocket-ebpf server --config /tmp/rocket-ebpf-server.yaml
 ```
 
 ## 介绍
@@ -72,9 +72,9 @@ sudo ./target/release/rocket-ebpf func hz /usr/lib/x86_64-linux-gnu/libc.so.6 ma
 sudo ./target/release/rocket-ebpf func latency /usr/lib/x86_64-linux-gnu/libc.so.6 malloc --pid 1234
 
 # server：按配置文件启动多个监控项，并把超阈值事件输出到 console/log/web
-./target/release/rocket-ebpf server --config configs/server.example.json --check
-cp configs/server.example.json /tmp/rocket-ebpf-server.json
-sudo ./target/release/rocket-ebpf server --config /tmp/rocket-ebpf-server.json
+./target/release/rocket-ebpf server --config configs/server.example.yaml --check
+cp configs/server.example.yaml /tmp/rocket-ebpf-server.yaml
+sudo ./target/release/rocket-ebpf server --config /tmp/rocket-ebpf-server.yaml
 ```
 
 `func hz`：符号须出现在 ELF 动态符号表中（可用 `readelf -Ws 库路径 | grep 符号` 粗查）；库路径建议用绝对路径，或在目标进程已映射时配合 `--pid` 以便从 `/proc/<pid>/maps` 解析（与 Aya `UProbe::attach` 行为一致）。
@@ -85,13 +85,15 @@ sudo ./target/release/rocket-ebpf server --config /tmp/rocket-ebpf-server.json
 
 ### Server daemon 配置
 
-`server` 子命令用于长期运行监控服务。第一阶段配置文件使用 **JSON**，示例见 [`configs/server.example.json`](configs/server.example.json)。示例中的监控项默认 `enabled: false`，请先复制并修改 `pid`、`library`、`symbol`、`thresholds` 和 `enabled` 后再用于真实监控。`--check` 只解析和校验配置，不加载 eBPF，适合在部署前或 CI 中快速检查：
+`server` 子命令用于长期运行监控服务。配置文件推荐使用 **YAML**（`.yaml` / `.yml`，支持注释）；也兼容 **JSON**（`.json`）。示例见 [`configs/server.example.yaml`](configs/server.example.yaml)，完整字段说明见 [`docs/server-config.md`](docs/server-config.md)。
+
+示例中的监控项请先复制并修改 `pid`、`library`、`symbol`、`thresholds` 和 `enabled` 后再用于真实监控。`--check` 只解析和校验配置，不加载 eBPF，适合在部署前或 CI 中快速检查：
 
 ```bash
-./target/release/rocket-ebpf server --config configs/server.example.json --check
+./target/release/rocket-ebpf server --config configs/server.example.yaml --check
 ```
 
-配置顶层字段：
+配置顶层字段摘要：
 
 | 字段 | 说明 |
 |------|------|

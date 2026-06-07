@@ -25,8 +25,7 @@ impl ServerConfig {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let raw = fs::read_to_string(path)
             .with_context(|| format!("读取 server 配置失败: {}", path.display()))?;
-        let cfg: Self = serde_json::from_str(&raw)
-            .with_context(|| format!("解析 JSON 配置失败: {}", path.display()))?;
+        let cfg = parse_config(&raw, path)?;
         cfg.validate()?;
         Ok(cfg)
     }
@@ -37,6 +36,8 @@ impl ServerConfig {
         }
 
         let mut names = HashSet::new();
+        let mut enabled_kinds: std::collections::HashMap<&'static str, &str> =
+            std::collections::HashMap::new();
         for monitor in &self.monitors {
             let common = monitor.common();
             if common.name.trim().is_empty() {
@@ -45,8 +46,20 @@ impl ServerConfig {
             if !names.insert(common.name.as_str()) {
                 bail!("monitor.name 重复: {}", common.name);
             }
-            if common.enabled && common.outputs.is_empty() {
-                bail!("monitor {} 启用时 outputs 不能为空", common.name);
+            if common.enabled {
+                if common.outputs.is_empty() {
+                    bail!("monitor {} 启用时 outputs 不能为空", common.name);
+                }
+                let kind = monitor.kind();
+                if let Some(other) = enabled_kinds.get(kind) {
+                    bail!(
+                        "不能同时启用多个 {kind} monitor（当前 eBPF 侧为单槽 map）：{other} 与 {}",
+                        common.name
+                    );
+                }
+                enabled_kinds.insert(kind, common.name.as_str());
+            } else {
+                continue;
             }
             for output in &common.outputs {
                 if !self.outputs.has_enabled(output) {
@@ -70,6 +83,34 @@ impl ServerConfig {
 
         Ok(())
     }
+}
+
+fn parse_config(raw: &str, path: &Path) -> anyhow::Result<ServerConfig> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "yaml" | "yml" => serde_yaml::from_str(raw)
+            .with_context(|| format!("解析 YAML 配置失败: {}", path.display())),
+        "json" => serde_json::from_str(raw)
+            .with_context(|| format!("解析 JSON 配置失败: {}", path.display())),
+        _ => bail!(
+            "不支持的配置文件格式: {}（请使用 .yaml、.yml 或 .json）",
+            path.display()
+        ),
+    }
+}
+
+/// 将毫秒阈值转为纳秒（内核 `SchedLatConfig.threshold_ns` 使用）；支持亚毫秒如 `0.001`。
+pub fn threshold_ms_to_ns(threshold_ms: f64) -> u64 {
+    if threshold_ms <= 0.0 {
+        return 0;
+    }
+    (threshold_ms * 1_000_000.0)
+        .round()
+        .clamp(0.0, u64::MAX as f64) as u64
 }
 
 fn validate_func(name: &str, probe: &FuncProbeConfig) -> anyhow::Result<()> {
@@ -207,6 +248,14 @@ impl MonitorConfig {
             Self::FuncHz(cfg) => &cfg.common,
         }
     }
+
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::SchedLatency(_) => "sched_latency",
+            Self::FuncLatency(_) => "func_latency",
+            Self::FuncHz(_) => "func_hz",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -309,7 +358,7 @@ pub struct SchedLatencyConfig {
     #[serde(flatten)]
     pub common: MonitorCommon,
     pub pid: u32,
-    pub threshold_ms: u64,
+    pub threshold_ms: f64,
     pub task_refresh_secs: u64,
     pub include_prev: bool,
 }
@@ -319,9 +368,23 @@ impl Default for SchedLatencyConfig {
         Self {
             common: MonitorCommon::default(),
             pid: 0,
-            threshold_ms: 0,
+            threshold_ms: 0.0,
             task_refresh_secs: 2,
             include_prev: false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::threshold_ms_to_ns;
+
+    #[test]
+    fn threshold_ms_to_ns_converts_floats() {
+        assert_eq!(threshold_ms_to_ns(0.0), 0);
+        assert_eq!(threshold_ms_to_ns(-1.0), 0);
+        assert_eq!(threshold_ms_to_ns(0.001), 1_000);
+        assert_eq!(threshold_ms_to_ns(1.0), 1_000_000);
+        assert_eq!(threshold_ms_to_ns(5.5), 5_500_000);
     }
 }

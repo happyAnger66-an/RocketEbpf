@@ -141,8 +141,9 @@ pub async fn run(
         task_refresh_secs,
         prev: show_prev,
     } = args;
-    let threshold_ns = threshold_ms.saturating_mul(1_000_000);
+    let threshold_ns = crate::config::threshold_ms_to_ns(threshold_ms);
     let refresh_secs = task_refresh_secs.max(1);
+    let web_monitor = format!("sched-latency-pid{pid}");
 
     {
         let mut cfg = Array::<_, SchedLatConfigPod>::try_from(
@@ -249,6 +250,7 @@ pub async fn run(
                         #[cfg(feature = "web")]
                         if let Some(tx) = &web_tx {
                             let _ = tx.send(crate::web::events::WebEvent::SchedLatency {
+                                monitor: web_monitor.clone(),
                                 wall_local: wall_local.clone(),
                                 tid: ev.tid,
                                 cpu: ev.cpu,
@@ -267,6 +269,7 @@ pub async fn run(
                         #[cfg(feature = "web")]
                         if let Some(tx) = &web_tx {
                             let _ = tx.send(crate::web::events::WebEvent::SchedLatency {
+                                monitor: web_monitor.clone(),
                                 wall_local: wall_local.clone(),
                                 tid: ev.tid,
                                 cpu: ev.cpu,

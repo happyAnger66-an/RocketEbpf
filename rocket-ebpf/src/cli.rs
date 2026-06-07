@@ -82,9 +82,9 @@ pub struct SchedLatencyArgs {
     /// 目标进程 PID（统计其线程组内所有线程）
     #[arg(long)]
     pub pid: u32,
-    /// 仅当调度延迟 **大于** 该毫秒数时打印（严格大于）
+    /// 仅当调度延迟 **大于** 该毫秒数时打印（严格大于）；支持小数，如 `0.001` 表示 1 微秒
     #[arg(long)]
-    pub threshold_ms: u64,
+    pub threshold_ms: f64,
     /// 周期刷新 `/proc/<pid>/task` 以纳入新线程（秒）
     #[arg(long, default_value_t = 2)]
     pub task_refresh_secs: u64,
@@ -114,7 +114,7 @@ pub struct FuncProbeArgs {
 /// `server` 参数：配置文件与校验模式。
 #[derive(Debug, Parser)]
 pub struct ServerArgs {
-    /// JSON 配置文件路径
+    /// 配置文件路径（支持 .yaml / .yml / .json）
     #[arg(long, short = 'c')]
     pub config: std::path::PathBuf,
     /// 只解析并校验配置，不加载 eBPF、不启动监控
