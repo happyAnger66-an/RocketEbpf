@@ -29,7 +29,7 @@ monitors:
     threshold_ms: 0
     task_refresh_secs: 2
     include_prev: true
-    outputs: [console, web]
+    outputs: [web]
 
   # 函数延迟：uprobe + uretprobe，按 interval_secs 周期聚合
   - type: func_latency
@@ -38,12 +38,12 @@ monitors:
     library: /usr/lib/x86_64-linux-gnu/libc.so.6
     symbol: malloc
     cxx: false
-    pid: 4526
+    pid: 75275
     interval_secs: 1
     thresholds:
       interval_avg_ns: 1000000
       interval_max_ns: 5000000
-    outputs: [console, web]
+    outputs: [web]
 
   # 函数频率：统计命中次数与全局相邻命中间隔峰值
   # 可与 sched_latency / func_latency 同时启用（server 共用一份 eBPF 对象）
@@ -58,4 +58,4 @@ monitors:
     # thresholds 仅影响 console/log 告警；Web UI 每个周期都会收到指标
     # 不设 thresholds 时 console 也会每周期打印
     thresholds: {}
-    outputs: [console, web]
+    outputs: [web]
