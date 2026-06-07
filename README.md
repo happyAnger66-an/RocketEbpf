@@ -14,6 +14,17 @@ sudo ./target/release/rocket-ebpf func hz /path/to/libfoo.so 'myns::Bar::run' --
 ## 使用说明
 [使用手册](./CLI.md)
 
+常驻监控场景可使用 **server daemon** 模式，通过配置文件一次启动多个监控项：
+
+```bash
+# 先校验配置，不加载 eBPF
+./target/release/rocket-ebpf server --config configs/server.example.json --check
+
+# 复制示例后修改 pid / library / enabled 等字段，再启动常驻监控
+cp configs/server.example.json /tmp/rocket-ebpf-server.json
+sudo ./target/release/rocket-ebpf server --config /tmp/rocket-ebpf-server.json
+```
+
 ## 介绍
 基于 **Rust** 与 **[Aya](https://github.com/aya-rs/aya)** 的 eBPF 观测与性能分析项目骨架。内核态程序编译为 eBPF 字节码，用户态加载、附加到钩子并处理数据（日志、环形缓冲、映射等）。
 
@@ -59,6 +70,11 @@ sudo ./target/release/rocket-ebpf func hz /usr/lib/x86_64-linux-gnu/libc.so.6 ma
 
 # func latency：uprobe + uretprobe，打印累计调用、全程平均耗时与本周期平均耗时（纳秒）
 sudo ./target/release/rocket-ebpf func latency /usr/lib/x86_64-linux-gnu/libc.so.6 malloc --pid 1234
+
+# server：按配置文件启动多个监控项，并把超阈值事件输出到 console/log/web
+./target/release/rocket-ebpf server --config configs/server.example.json --check
+cp configs/server.example.json /tmp/rocket-ebpf-server.json
+sudo ./target/release/rocket-ebpf server --config /tmp/rocket-ebpf-server.json
 ```
 
 `func hz`：符号须出现在 ELF 动态符号表中（可用 `readelf -Ws 库路径 | grep 符号` 粗查）；库路径建议用绝对路径，或在目标进程已映射时配合 `--pid` 以便从 `/proc/<pid>/maps` 解析（与 Aya `UProbe::attach` 行为一致）。
@@ -66,6 +82,37 @@ sudo ./target/release/rocket-ebpf func latency /usr/lib/x86_64-linux-gnu/libc.so
 **C++ 动态库**：ELF 里多为 **mangled**（`_Z...`），可先 `readelf -Ws libxx.so | c++filt` 对照 demangle 名。本工具支持 **`--cxx`**：用 demangle 后的**全名**或**在候选中唯一的子串**匹配（Itanium ABI，与 `cpp_demangle` 一致）；若仍有重载歧义，请改用更完整的 demangle 字符串，或直接传 **mangled** 名（此时不必加 `--cxx`，或加上且与 ELF 中字符串完全一致也可）。
 
 按 **Ctrl-C** 退出后，对应 attach 会随进程结束而释放。
+
+### Server daemon 配置
+
+`server` 子命令用于长期运行监控服务。第一阶段配置文件使用 **JSON**，示例见 [`configs/server.example.json`](configs/server.example.json)。示例中的监控项默认 `enabled: false`，请先复制并修改 `pid`、`library`、`symbol`、`thresholds` 和 `enabled` 后再用于真实监控。`--check` 只解析和校验配置，不加载 eBPF，适合在部署前或 CI 中快速检查：
+
+```bash
+./target/release/rocket-ebpf server --config configs/server.example.json --check
+```
+
+配置顶层字段：
+
+| 字段 | 说明 |
+|------|------|
+| `server.web.enabled` | 是否启动 Web UI / SSE 服务 |
+| `server.web.listen` | Web 监听地址，目前读取端口部分，示例：`0.0.0.0:8080` |
+| `outputs.console.enabled` | 是否允许输出到控制台 |
+| `outputs.log.enabled` / `outputs.log.path` | 是否写 JSONL 日志，以及日志路径 |
+| `outputs.web.enabled` | 是否把事件推送到 Web UI |
+| `monitors[]` | 监控项列表，每项用 `type` 区分类型 |
+
+当前支持的 `monitors[].type`：
+
+| 类型 | 关键字段 | 说明 |
+|------|----------|------|
+| `sched_latency` | `pid`、`threshold_ms`、`task_refresh_secs`、`include_prev` | 监控目标进程线程的「唤醒 → 运行」调度延迟，超过阈值后输出 |
+| `func_latency` | `library`、`symbol`、`pid`、`interval_secs`、`thresholds.interval_avg_ns`、`thresholds.interval_max_ns` | 统计用户态函数周期调用延迟，超过配置阈值后输出 |
+| `func_hz` | `library`、`symbol`、`pid`、`interval_secs`、`thresholds.min_delta`、`thresholds.max_gap_ms` | 统计用户态函数调用频率与全局相邻命中最大间隔 |
+
+每个监控项都有通用字段：`name`、`enabled`、`outputs`。`outputs` 只能引用已启用的输出方向，例如 `["console", "log", "web"]`。函数类监控还支持 `cxx: true`，用于按 C++ demangle 后的符号名匹配。
+
+第一阶段实现中，server 会为每个启用的 monitor 独立加载一份 eBPF object，以避免当前聚合 map 在多监控项之间混淆。这样更利于先把 daemon 模式跑通，但资源占用会高于共享单个 eBPF object；后续可通过 `monitor_id` / attach cookie 改成更细粒度的多实例隔离。
 
 `exec` 子命令在内核中解析 `sched:sched_process_exec` 的 `filename` 与 `pid`，并结合 `bpf_get_current_comm` 打印 **进程短名（comm）** 与 **被执行文件路径**；默认已将未设置 `RUST_LOG` 时的日志级别设为 `info`，便于直接看到每条 exec。若路径解析异常，请对照本机 `tracing/events/sched/sched_process_exec/format` 是否与 eBPF 中偏移常量一致。
 

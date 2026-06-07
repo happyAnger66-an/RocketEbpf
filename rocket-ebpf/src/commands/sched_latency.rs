@@ -1,18 +1,11 @@
-use std::{
-    borrow::BorrowMut,
-    collections::HashSet,
-    ffi::OsStr,
-    fs, io,
-    mem,
-    time::Duration,
-};
+use std::{borrow::BorrowMut, collections::HashSet, ffi::OsStr, fs, io, mem, time::Duration};
 
 use anyhow::Context as _;
-use chrono::{DateTime, Local};
 use aya::maps::{Array, HashMap, MapData, RingBuf};
 use aya::programs::TracePoint;
-use aya::Pod;
 use aya::Ebpf;
+use aya::Pod;
+use chrono::{DateTime, Local};
 use rocket_ebpf_common::{SchedLatConfig, SchedLatEvent};
 use tokio::signal;
 
@@ -100,14 +93,14 @@ where
     T: BorrowMut<MapData>,
 {
     let tids = read_task_tids(proc_pid).with_context(|| {
-        format!(
-            "读取进程 {proc_pid} 的线程列表失败（需 /proc 可见，且 PID 为线程组组长）"
-        )
+        format!("读取进程 {proc_pid} 的线程列表失败（需 /proc 可见，且 PID 为线程组组长）")
     })?;
     let live: HashSet<u32> = tids.iter().copied().collect();
     let mut stale = Vec::new();
     for k in filter.keys() {
-        let tid = k.map_err(anyhow::Error::from).context("枚举 SCHED_LAT_FILTER 键")?;
+        let tid = k
+            .map_err(anyhow::Error::from)
+            .context("枚举 SCHED_LAT_FILTER 键")?;
         if !live.contains(&tid) {
             stale.push(tid);
         }
@@ -137,7 +130,11 @@ type WebTx = tokio::sync::broadcast::Sender<crate::web::events::WebEvent>;
 #[cfg(not(feature = "web"))]
 type WebTx = ();
 
-pub async fn run(ebpf: &mut Ebpf, args: SchedLatencyArgs, web_tx: Option<WebTx>) -> anyhow::Result<()> {
+pub async fn run(
+    ebpf: &mut Ebpf,
+    args: SchedLatencyArgs,
+    web_tx: Option<WebTx>,
+) -> anyhow::Result<()> {
     let SchedLatencyArgs {
         pid,
         threshold_ms,
@@ -167,7 +164,8 @@ pub async fn run(ebpf: &mut Ebpf, args: SchedLatencyArgs, web_tx: Option<WebTx>)
     }
 
     let mut filter = HashMap::try_from(
-        ebpf.take_map("SCHED_LAT_FILTER").context("未找到 map SCHED_LAT_FILTER")?,
+        ebpf.take_map("SCHED_LAT_FILTER")
+            .context("未找到 map SCHED_LAT_FILTER")?,
     )
     .context("打开 SCHED_LAT_FILTER 失败")?;
 
@@ -195,7 +193,8 @@ pub async fn run(ebpf: &mut Ebpf, args: SchedLatencyArgs, web_tx: Option<WebTx>)
     }
 
     let mut ring = RingBuf::try_from(
-        ebpf.take_map("SCHED_LAT_EVENTS").context("未找到 map SCHED_LAT_EVENTS")?,
+        ebpf.take_map("SCHED_LAT_EVENTS")
+            .context("未找到 map SCHED_LAT_EVENTS")?,
     )
     .context("打开 SCHED_LAT_EVENTS 失败")?;
 

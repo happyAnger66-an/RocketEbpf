@@ -1,6 +1,8 @@
 //! 集成 / e2e 测试：`--help` 链无需特权；加载 eBPF 的用例默认 `#[ignore]`，需 root + `ROCKETEBPF_E2E=1`。
 use std::{
+    fs,
     io::{BufRead, BufReader},
+    path::PathBuf,
     process::{Child, Command, Stdio},
     sync::mpsc,
     thread,
@@ -9,6 +11,15 @@ use std::{
 
 fn exe() -> &'static str {
     env!("CARGO_BIN_EXE_rocket-ebpf")
+}
+
+fn temp_config_path(name: &str) -> PathBuf {
+    let unique = format!(
+        "rocket-ebpf-{name}-{}-{}.json",
+        std::process::id(),
+        Instant::now().elapsed().as_nanos()
+    );
+    std::env::temp_dir().join(unique)
 }
 
 fn combined_output(stdout: &[u8], stderr: &[u8]) -> String {
@@ -82,6 +93,7 @@ fn cli_help_smoke() {
         "open",
         "func",
         "sched",
+        "server",
         "RocketEbpf",
     ] {
         assert!(
@@ -112,6 +124,7 @@ fn cli_subcommand_help_smoke() {
         &["func", "latency", "--help"],
         &["sched", "--help"],
         &["sched", "latency", "--help"],
+        &["server", "--help"],
     ];
 
     for args in cases {
@@ -134,6 +147,102 @@ fn cli_subcommand_help_smoke() {
             args.join(" ")
         );
     }
+}
+
+#[test]
+fn cli_server_check_accepts_valid_config() {
+    let path = temp_config_path("server-ok");
+    fs::write(
+        &path,
+        r#"
+{
+  "outputs": {
+    "console": { "enabled": true },
+    "log": { "enabled": false },
+    "web": { "enabled": false }
+  },
+  "monitors": [
+    {
+      "type": "func_hz",
+      "name": "malloc-hz",
+      "enabled": true,
+      "library": "/usr/lib/x86_64-linux-gnu/libc.so.6",
+      "symbol": "malloc",
+      "interval_secs": 1,
+      "outputs": ["console"],
+      "thresholds": { "min_delta": 1 }
+    }
+  ]
+}
+"#,
+    )
+    .expect("write config");
+
+    let out = Command::new(exe())
+        .args(["server", "--config"])
+        .arg(&path)
+        .arg("--check")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("server --check");
+
+    let _ = fs::remove_file(&path);
+    let combined = combined_output(&out.stdout, &out.stderr);
+    assert!(
+        out.status.success(),
+        "valid server config should pass: {combined}"
+    );
+    assert!(
+        combined.contains("server config ok"),
+        "server --check should report ok:\n{combined}"
+    );
+}
+
+#[test]
+fn cli_server_check_rejects_bad_output_reference() {
+    let path = temp_config_path("server-bad-output");
+    fs::write(
+        &path,
+        r#"
+{
+  "outputs": {
+    "console": { "enabled": true }
+  },
+  "monitors": [
+    {
+      "type": "sched_latency",
+      "name": "bad-sched",
+      "enabled": true,
+      "pid": 1,
+      "threshold_ms": 5,
+      "outputs": ["web"]
+    }
+  ]
+}
+"#,
+    )
+    .expect("write config");
+
+    let out = Command::new(exe())
+        .args(["server", "--config"])
+        .arg(&path)
+        .arg("--check")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("server --check bad output");
+
+    let _ = fs::remove_file(&path);
+    let combined = combined_output(&out.stdout, &out.stderr);
+    assert!(
+        !out.status.success(),
+        "bad output reference should fail: {combined}"
+    );
+    assert!(
+        combined.contains("未启用或未知的输出方向"),
+        "error should mention output validation:\n{combined}"
+    );
 }
 
 #[test]
@@ -176,12 +285,7 @@ fn cli_sched_latency_help_mentions_pid_and_threshold() {
         .expect("sched latency --help");
     assert!(out.status.success());
     let c = combined_output(&out.stdout, &out.stderr);
-    for needle in [
-        "--pid",
-        "--threshold-ms",
-        "--task-refresh-secs",
-        "--prev",
-    ] {
+    for needle in ["--pid", "--threshold-ms", "--task-refresh-secs", "--prev"] {
         assert!(
             c.contains(needle),
             "sched latency --help should mention {needle:?}\n{c}"
@@ -228,7 +332,7 @@ fn e2e_exec_attach_outputs_exec_event() {
         return;
     }
 
-    let mut child = Command::new(exe())
+    let child = Command::new(exe())
         .arg("exec")
         .env("RUST_LOG", "info")
         .stdout(Stdio::piped())
@@ -259,7 +363,7 @@ fn e2e_open_attach_outputs_openat_log() {
         return;
     }
 
-    let mut child = Command::new(exe())
+    let child = Command::new(exe())
         .arg("open")
         .env("RUST_LOG", "info")
         .stdout(Stdio::piped())

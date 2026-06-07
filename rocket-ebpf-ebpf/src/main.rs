@@ -2,7 +2,6 @@
 #![no_main]
 
 use aya_ebpf::{
-    EbpfContext,
     helpers::{
         bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_smp_processor_id, bpf_ktime_get_ns,
         bpf_probe_read_kernel, bpf_probe_read_kernel_buf, bpf_probe_read_kernel_str_bytes,
@@ -10,11 +9,12 @@ use aya_ebpf::{
     macros::{map, tracepoint, uprobe, uretprobe},
     maps::{Array, HashMap, PerCpuArray, RingBuf},
     programs::{ProbeContext, RetProbeContext, TracePointContext},
+    EbpfContext,
 };
+use aya_log_ebpf::info;
 use rocket_ebpf_common::{
     FuncHzGlobalGap, FuncHzPerCpu, FuncLatencyAgg, SchedLatConfig, SchedLatEvent,
 };
-use aya_log_ebpf::info;
 
 /// `sched:sched_process_exec` 的 trace 记录布局（`struct trace_entry` 8 字节后）：
 /// `__data_loc filename` @8、`pid` @12。与 `tracing/.../sched_process_exec/format` 一致。
@@ -87,8 +87,9 @@ fn try_sched_process_exec(ctx: TracePointContext) -> Result<u32, u32> {
     let base = ctx.as_ptr() as *const u8;
 
     // 必须用 bpf_probe_read_kernel：tracepoint 载荷在内核内存，旧版 bpf_probe_read 易遭验证器拒绝
-    let data_loc: u32 =
-        unsafe { bpf_probe_read_kernel(base.add(TP_OFF_DATA_LOC) as *const u32).map_err(|_| 0u32)? };
+    let data_loc: u32 = unsafe {
+        bpf_probe_read_kernel(base.add(TP_OFF_DATA_LOC) as *const u32).map_err(|_| 0u32)?
+    };
     let str_off = (data_loc as usize) & 0xFFFF & TP_FILENAME_OFF_MASK;
 
     let tp_pid: i32 =
@@ -100,18 +101,17 @@ fn try_sched_process_exec(ctx: TracePointContext) -> Result<u32, u32> {
     };
 
     let filename_ptr = unsafe { base.add(str_off) };
-    let file = match unsafe { bpf_probe_read_kernel_str_bytes(filename_ptr, path_buf.as_mut_slice()) }
-    {
-        Ok(slice) => bytes_slice_to_str(slice),
-        Err(_) => "?",
-    };
+    let file =
+        match unsafe { bpf_probe_read_kernel_str_bytes(filename_ptr, path_buf.as_mut_slice()) } {
+            Ok(slice) => bytes_slice_to_str(slice),
+            Err(_) => "?",
+        };
 
     let tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
 
     info!(
         &ctx,
-        "exec pid={} tgid={} comm={} file={}",
-        tp_pid, tgid, comm, file
+        "exec pid={} tgid={} comm={} file={}", tp_pid, tgid, comm, file
     );
     Ok(0)
 }
@@ -211,7 +211,8 @@ fn try_sched_lat_switch(ctx: TracePointContext) -> Result<u32, u32> {
     let (prev_tid, prev_comm) = if include_prev != 0 {
         let mut pc = [0u8; 16];
         unsafe {
-            if bpf_probe_read_kernel_buf(base.add(TP_SCHED_SWITCH_PREV_COMM_OFF), &mut pc).is_err() {
+            if bpf_probe_read_kernel_buf(base.add(TP_SCHED_SWITCH_PREV_COMM_OFF), &mut pc).is_err()
+            {
                 pc = [0u8; 16];
             }
         }

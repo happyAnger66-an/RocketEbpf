@@ -9,8 +9,8 @@ use clap::{Parser, Subcommand};
     long_about = "RocketEbpf 将内核态 eBPF 与用户态加载器打包在同一二进制中。\n\
 请选择子命令以附加对应 tracepoint；一般需要 root 或 CAP_BPF 等权限。\n\
 内核侧日志由 aya-log 送到用户态，可通过环境变量 RUST_LOG（如 info、debug）控制详细程度。",
-    after_long_help = "示例:\n  rocket-ebpf --help\n  rocket-ebpf exec --help\n  sudo RUST_LOG=info rocket-ebpf exec\n  sudo RUST_LOG=info rocket-ebpf open\n  sudo rocket-ebpf func hz /usr/lib/x86_64-linux-gnu/libc.so.6 malloc --pid 1234\n  sudo rocket-ebpf func latency /usr/lib/x86_64-linux-gnu/libc.so.6 malloc --pid 1234\n  sudo rocket-ebpf func hz /path/to/libfoo.so 'ns::Bar::run' --cxx --pid 1234\n  sudo rocket-ebpf sched latency --pid 1234 --threshold-ms 5",
-    propagate_version = true,
+    after_long_help = "示例:\n  rocket-ebpf --help\n  rocket-ebpf exec --help\n  sudo RUST_LOG=info rocket-ebpf exec\n  sudo RUST_LOG=info rocket-ebpf open\n  sudo rocket-ebpf func hz /usr/lib/x86_64-linux-gnu/libc.so.6 malloc --pid 1234\n  sudo rocket-ebpf func latency /usr/lib/x86_64-linux-gnu/libc.so.6 malloc --pid 1234\n  sudo rocket-ebpf func hz /path/to/libfoo.so 'ns::Bar::run' --cxx --pid 1234\n  sudo rocket-ebpf sched latency --pid 1234 --threshold-ms 5\n  sudo rocket-ebpf server --config /etc/rocket-ebpf/config.yaml",
+    propagate_version = true
 )]
 pub struct Cli {
     /// 启用 Web 前端（HTTP + SSE 实时推送性能数据）
@@ -50,6 +50,12 @@ pub enum Commands {
         long_about = "基于 sched 类 tracepoint 观测调度行为。\n一般需 root 或足够 capability。"
     )]
     Sched(SchedCmd),
+
+    /// 以 server daemon 方式按配置启动多个监控项
+    #[command(
+        long_about = "读取配置文件并启动常驻监控服务。每个监控项独立加载一份 eBPF 对象，以避免第一阶段中聚合 map 多实例混淆。"
+    )]
+    Server(ServerArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -63,12 +69,10 @@ pub enum FuncCmd {
 #[derive(Debug, Subcommand)]
 pub enum SchedCmd {
     /// 统计指定进程内线程「唤醒 → 运行」延迟超过阈值的事件（线程 TID、运行 CPU、时间）
-    #[command(
-        long_about = "附加 sched:sched_waking 与 sched:sched_switch。\n\
+    #[command(long_about = "附加 sched:sched_waking 与 sched:sched_switch。\n\
 对 `/proc/<pid>/task` 下的线程打标，仅在目标进程线程被唤醒后、于 **`sched_switch` 切上 CPU** 时计算延迟。\n\
 延迟 **严格大于** `--threshold-ms` 时通过 ring buffer 上报（需内核 ≥ 5.8）。\n\
-布局与当前主线内核 `trace/events/sched.h` 中 `sched_wakeup_template` / `sched_switch` 一致（x86_64）。"
-    )]
+布局与当前主线内核 `trace/events/sched.h` 中 `sched_wakeup_template` / `sched_switch` 一致（x86_64）。")]
     Latency(SchedLatencyArgs),
 }
 
@@ -105,4 +109,15 @@ pub struct FuncProbeArgs {
     /// 打印间隔（秒）
     #[arg(long, default_value_t = 1)]
     pub interval: u64,
+}
+
+/// `server` 参数：配置文件与校验模式。
+#[derive(Debug, Parser)]
+pub struct ServerArgs {
+    /// JSON 配置文件路径
+    #[arg(long, short = 'c')]
+    pub config: std::path::PathBuf,
+    /// 只解析并校验配置，不加载 eBPF、不启动监控
+    #[arg(long, default_value_t = false)]
+    pub check: bool,
 }

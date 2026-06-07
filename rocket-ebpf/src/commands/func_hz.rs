@@ -27,7 +27,11 @@ type WebTx = tokio::sync::broadcast::Sender<crate::web::events::WebEvent>;
 #[cfg(not(feature = "web"))]
 type WebTx = ();
 
-pub async fn run(ebpf: &mut Ebpf, args: FuncProbeArgs, web_tx: Option<WebTx>) -> anyhow::Result<()> {
+pub async fn run(
+    ebpf: &mut Ebpf,
+    args: FuncProbeArgs,
+    web_tx: Option<WebTx>,
+) -> anyhow::Result<()> {
     let FuncProbeArgs {
         library,
         symbol,

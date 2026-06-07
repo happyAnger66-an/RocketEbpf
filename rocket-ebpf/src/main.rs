@@ -1,7 +1,9 @@
 mod cli;
 mod commands;
+mod config;
 mod cxx_symbol;
 mod ebpf;
+mod server;
 #[cfg(feature = "web")]
 mod web;
 
@@ -16,27 +18,37 @@ async fn main() -> anyhow::Result<()> {
     // 未设置 RUST_LOG 时默认 info，便于看到 aya-log 转发的 exec 行
     env_logger::Builder::from_env(Env::default().default_filter_or("info")).init();
 
-    let cli = cli::Cli::parse();
+    let cli::Cli {
+        web,
+        web_port,
+        command,
+    } = cli::Cli::parse();
+
+    let command = match command {
+        cli::Commands::Server(args) => return server::run(args).await,
+        other => other,
+    };
+
     let mut ebpf = ebpf::load_and_init_logger()?;
 
     #[cfg(feature = "web")]
-    let web_tx: Option<WebTx> = if cli.web {
+    let web_tx: Option<WebTx> = if web {
         let server = web::WebServer::new(256);
         let tx = server.sender();
-        server.start(cli.web_port).await?;
-        eprintln!("Web UI: http://0.0.0.0:{}", cli.web_port);
+        server.start(web_port).await?;
+        eprintln!("Web UI: http://0.0.0.0:{}", web_port);
         Some(tx)
     } else {
         None
     };
     #[cfg(not(feature = "web"))]
-    let web_tx: Option<()> = if cli.web {
+    let web_tx: Option<()> = if web {
         anyhow::bail!("此二进制编译时未启用 web feature；请用 --features web 重新构建");
     } else {
         None
     };
 
-    match cli.command {
+    match command {
         cli::Commands::Exec => commands::run_exec(&mut ebpf).await,
         cli::Commands::Open => commands::run_open(&mut ebpf).await,
         cli::Commands::Func(sub) => match sub {
@@ -50,5 +62,6 @@ async fn main() -> anyhow::Result<()> {
                 commands::run_sched_latency(&mut ebpf, args, web_tx).await
             }
         },
+        cli::Commands::Server(_) => unreachable!("server command returned before loading eBPF"),
     }
 }

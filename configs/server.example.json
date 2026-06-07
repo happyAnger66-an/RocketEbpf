@@ -1,0 +1,62 @@
+{
+  "server": {
+    "web": {
+      "enabled": true,
+      "listen": "0.0.0.0:8080"
+    }
+  },
+  "outputs": {
+    "console": {
+      "enabled": true
+    },
+    "log": {
+      "enabled": false,
+      "path": "/tmp/rocket-ebpf-events.jsonl"
+    },
+    "web": {
+      "enabled": true
+    }
+  },
+  "monitors": [
+    {
+      "type": "sched_latency",
+      "name": "target-sched-latency",
+      "enabled": false,
+      "pid": 1234,
+      "threshold_ms": 5,
+      "task_refresh_secs": 2,
+      "include_prev": true,
+      "outputs": ["console", "web"]
+    },
+    {
+      "type": "func_latency",
+      "name": "malloc-latency",
+      "enabled": true,
+      "library": "/usr/lib/x86_64-linux-gnu/libc.so.6",
+      "symbol": "malloc",
+      "cxx": false,
+      "pid": 4386,
+      "interval_secs": 1,
+      "thresholds": {
+        "interval_avg_ns": 1000000,
+        "interval_max_ns": 5000000
+      },
+      "outputs": ["console", "web"]
+    },
+    {
+      "type": "func_hz",
+      "name": "malloc-hz",
+      "enabled": false,
+      "library": "/usr/lib/x86_64-linux-gnu/libc.so.6",
+      "symbol": "malloc",
+      "cxx": false,
+      "pid": 1234,
+      "interval_secs": 1,
+      "thresholds": {
+        "min_delta": 1000,
+        "max_gap_ms": 100
+      },
+      "outputs": ["console", "web"]
+    }
+  ]
+}

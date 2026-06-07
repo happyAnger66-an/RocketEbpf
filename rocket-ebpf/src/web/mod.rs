@@ -4,15 +4,15 @@ use std::convert::Infallible;
 use std::time::Duration;
 
 use axum::{
-    Router,
     response::{
-        Html,
         sse::{Event, KeepAlive, Sse},
+        Html,
     },
     routing::get,
+    Router,
 };
 use tokio::sync::broadcast;
-use tokio_stream::{Stream, StreamExt as _, wrappers::BroadcastStream};
+use tokio_stream::{wrappers::BroadcastStream, Stream, StreamExt as _};
 
 use events::WebEvent;
 
