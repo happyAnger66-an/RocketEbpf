@@ -15,16 +15,22 @@ use aya::{
 };
 use chrono::Local;
 use rocket_ebpf_common::{
-    FuncHzGlobalGap, FuncHzPerCpu, FuncLatencyAgg, SchedLatConfig, SchedLatEvent,
+    FuncHzGlobalGap, FuncHzPerCpu, FuncLatencyAgg, MwSdtTraceEvent, SchedLatConfig, SchedLatEvent,
+    MW_SDT_MAX_MONITORS,
 };
 use serde::Serialize;
 use tokio::signal;
 
 use crate::{
     cli::ServerArgs,
+    stats::IntervalPercentileTracker,
     config::{
-        FuncHzConfig, FuncLatencyConfig, FuncProbeConfig, MonitorConfig, SchedLatencyConfig,
-        ServerConfig,
+        field_yaml_to_decls, FuncHzConfig, FuncLatencyConfig, FuncProbeConfig, MonitorConfig,
+        MwSdtHzConfig, MwSdtTraceConfig, SchedLatencyConfig, ServerConfig,
+    },
+    usdt::{
+        attach_mw_sdt_hz, attach_mw_sdt_trace, build_trace_cfg, decode_trace_event,
+        validate_fields_against_probe, MwSdtFieldType,
     },
 };
 
@@ -93,6 +99,29 @@ enum AlertEvent {
         prev_tid: Option<u32>,
         prev_comm: Option<String>,
     },
+    MwSdtHz {
+        ts: String,
+        monitor: String,
+        binary: String,
+        usdt: String,
+        hits: u64,
+        delta: u64,
+        hz: f64,
+        max_gap_ms: f64,
+        /// 自统计以来各周期 hz 的 p1（低位吞吐，反映较差情况）
+        hz_p1: Option<f64>,
+        /// 自统计以来各周期 max_gap_ms 的 p99（停顿尾部）
+        gap_p99_ms: Option<f64>,
+    },
+    MwSdtTrace {
+        ts: String,
+        monitor: String,
+        binary: String,
+        usdt: String,
+        pid: u32,
+        cpu: u32,
+        fields: std::collections::HashMap<String, String>,
+    },
 }
 
 pub async fn run(args: ServerArgs) -> anyhow::Result<()> {
@@ -110,6 +139,10 @@ pub async fn run(args: ServerArgs) -> anyhow::Result<()> {
     let mut ebpf = crate::ebpf::load_and_init_logger()?;
     eprintln!("已加载 eBPF 对象（各 monitor 共用一份，依次 attach）");
     let mut tasks = Vec::new();
+    let mut mw_sdt_hz_maps: Option<Arc<Mutex<MwSdtHzMaps>>> = None;
+    let mut mw_sdt_trace_ring: Option<Arc<Mutex<RingBuf<MapData>>>> = None;
+    let mut mw_sdt_hz_next_id: u32 = 0;
+    let mut mw_sdt_trace_next_id: u32 = 0;
 
     for monitor in cfg.monitors {
         if !monitor.common().enabled {
@@ -118,10 +151,56 @@ pub async fn run(args: ServerArgs) -> anyhow::Result<()> {
         }
         let rt = runtime.clone();
         let name = monitor.common().name.clone();
-        match spawn_monitor(monitor, &mut ebpf, rt) {
-            Ok(task) => tasks.push(task),
-            Err(e) => eprintln!("monitor {name} 启动失败: {e:#}"),
-        }
+        let task = match monitor {
+            MonitorConfig::MwSdtHz(cfg) => {
+                let monitor_id = mw_sdt_hz_next_id;
+                mw_sdt_hz_next_id += 1;
+                if monitor_id as usize >= MW_SDT_MAX_MONITORS {
+                    eprintln!(
+                        "monitor {name} 启动失败: mw_sdt_hz monitor_id 超出上限 {MW_SDT_MAX_MONITORS}"
+                    );
+                    continue;
+                }
+                match spawn_mw_sdt_hz(cfg, &mut ebpf, rt, monitor_id, &mut mw_sdt_hz_maps) {
+                    Ok(task) => task,
+                    Err(e) => {
+                        eprintln!("monitor {name} 启动失败: {e:#}");
+                        continue;
+                    }
+                }
+            }
+            MonitorConfig::MwSdtTrace(cfg) => {
+                let monitor_id = mw_sdt_trace_next_id;
+                mw_sdt_trace_next_id += 1;
+                if monitor_id as usize >= MW_SDT_MAX_MONITORS {
+                    eprintln!(
+                        "monitor {name} 启动失败: mw_sdt_trace monitor_id 超出上限 {MW_SDT_MAX_MONITORS}"
+                    );
+                    continue;
+                }
+                match spawn_mw_sdt_trace(
+                    cfg,
+                    &mut ebpf,
+                    rt,
+                    monitor_id,
+                    &mut mw_sdt_trace_ring,
+                ) {
+                    Ok(task) => task,
+                    Err(e) => {
+                        eprintln!("monitor {name} 启动失败: {e:#}");
+                        continue;
+                    }
+                }
+            }
+            other => match spawn_monitor(other, &mut ebpf, rt) {
+                Ok(task) => task,
+                Err(e) => {
+                    eprintln!("monitor {name} 启动失败: {e:#}");
+                    continue;
+                }
+            },
+        };
+        tasks.push(task);
     }
 
     if tasks.is_empty() {
@@ -171,7 +250,128 @@ fn spawn_monitor(
                 }
             })
         }
+        MonitorConfig::MwSdtHz(_) | MonitorConfig::MwSdtTrace(_) => {
+            anyhow::bail!("mw_sdt monitor 应由 run() 内专用路径启动");
+        }
     })
+}
+
+struct MwSdtHzMaps {
+    hits: PerCpuArray<MapData, FuncHzPerCpuPod>,
+    gap: Array<MapData, FuncHzGlobalGapPod>,
+}
+
+fn spawn_mw_sdt_hz(
+    cfg: MwSdtHzConfig,
+    ebpf: &mut Ebpf,
+    runtime: ServerRuntime,
+    monitor_id: u32,
+    maps: &mut Option<Arc<Mutex<MwSdtHzMaps>>>,
+) -> anyhow::Result<tokio::task::JoinHandle<()>> {
+    if maps.is_none() {
+        let hits = PerCpuArray::<_, FuncHzPerCpuPod>::try_from(
+            ebpf.take_map("MW_SDT_HZ_STATS")
+                .context("未找到 map MW_SDT_HZ_STATS")?,
+        )
+        .context("打开 MW_SDT_HZ_STATS 失败")?;
+        let gap = Array::<_, FuncHzGlobalGapPod>::try_from(
+            ebpf.take_map("MW_SDT_HZ_GAP")
+                .context("未找到 map MW_SDT_HZ_GAP")?,
+        )
+        .context("打开 MW_SDT_HZ_GAP 失败")?;
+        *maps = Some(Arc::new(Mutex::new(MwSdtHzMaps { hits, gap })));
+    }
+
+    let (resolved, probe) = attach_mw_sdt_hz(
+        ebpf,
+        &cfg.probe.binary,
+        &cfg.probe.provider,
+        &cfg.probe.probe,
+        cfg.probe.pid,
+        monitor_id,
+    )?;
+    let usdt_label = format!("{}:{}", cfg.probe.provider, cfg.probe.probe);
+    let name = cfg.common.name.clone();
+
+    eprintln!(
+        "monitor={name} 已启动 mw_sdt_hz：id={monitor_id} binary={} usdt={usdt_label} offset=0x{:x} args={}",
+        resolved.display(),
+        probe.pc_offset,
+        probe.arg_count
+    );
+
+    let runner = MwSdtHzRunner {
+        maps: maps.as_ref().unwrap().clone(),
+        monitor_id,
+        usdt_label,
+        resolved_binary: resolved.display().to_string(),
+        cfg,
+        runtime,
+        percentiles: IntervalPercentileTracker::default(),
+    };
+    Ok(tokio::spawn(async move {
+        if let Err(e) = runner.run().await {
+            eprintln!("monitor {name} 退出: {e:#}");
+        }
+    }))
+}
+
+fn spawn_mw_sdt_trace(
+    cfg: MwSdtTraceConfig,
+    ebpf: &mut Ebpf,
+    runtime: ServerRuntime,
+    monitor_id: u32,
+    ring: &mut Option<Arc<Mutex<RingBuf<MapData>>>>,
+) -> anyhow::Result<tokio::task::JoinHandle<()>> {
+    if ring.is_none() {
+        let rb = RingBuf::try_from(
+            ebpf.take_map("MW_SDT_TRACE_EVENTS")
+                .context("未找到 map MW_SDT_TRACE_EVENTS")?,
+        )
+        .context("打开 MW_SDT_TRACE_EVENTS 失败")?;
+        *ring = Some(Arc::new(Mutex::new(rb)));
+    }
+
+    let field_decls = field_yaml_to_decls(&cfg.fields)?;
+    let trace_cfg = build_trace_cfg(&field_decls, cfg.probe.sample_rate)?;
+    let (resolved, probe) = attach_mw_sdt_trace(
+        ebpf,
+        &cfg.probe.binary,
+        &cfg.probe.provider,
+        &cfg.probe.probe,
+        cfg.probe.pid,
+        monitor_id,
+        &trace_cfg,
+    )?;
+    validate_fields_against_probe(&field_decls, &probe)?;
+    let usdt_label = format!("{}:{}", cfg.probe.provider, cfg.probe.probe);
+    let field_names: Vec<String> = field_decls.iter().map(|f| f.name.clone()).collect();
+    let field_types: Vec<MwSdtFieldType> = field_decls.iter().map(|f| f.field_type).collect();
+    let name = cfg.common.name.clone();
+
+    eprintln!(
+        "monitor={name} 已启动 mw_sdt_trace：id={monitor_id} binary={} usdt={usdt_label} offset=0x{:x} fields={} sample_rate={}",
+        resolved.display(),
+        probe.pc_offset,
+        field_names.len(),
+        cfg.probe.sample_rate
+    );
+
+    let runner = MwSdtTraceRunner {
+        ring: ring.as_ref().unwrap().clone(),
+        monitor_id,
+        usdt_label,
+        resolved_binary: resolved.display().to_string(),
+        field_names,
+        field_types,
+        cfg,
+        runtime,
+    };
+    Ok(tokio::spawn(async move {
+        if let Err(e) = runner.run().await {
+            eprintln!("monitor {name} 退出: {e:#}");
+        }
+    }))
 }
 
 struct FuncHzRunner {
@@ -179,6 +379,27 @@ struct FuncHzRunner {
     gap: Array<MapData, FuncHzGlobalGapPod>,
     attach_symbol: String,
     cfg: FuncHzConfig,
+    runtime: ServerRuntime,
+}
+
+struct MwSdtHzRunner {
+    maps: Arc<Mutex<MwSdtHzMaps>>,
+    monitor_id: u32,
+    usdt_label: String,
+    resolved_binary: String,
+    cfg: MwSdtHzConfig,
+    runtime: ServerRuntime,
+    percentiles: IntervalPercentileTracker,
+}
+
+struct MwSdtTraceRunner {
+    ring: Arc<Mutex<RingBuf<MapData>>>,
+    monitor_id: u32,
+    usdt_label: String,
+    resolved_binary: String,
+    field_names: Vec<String>,
+    field_types: Vec<MwSdtFieldType>,
+    cfg: MwSdtTraceConfig,
     runtime: ServerRuntime,
 }
 
@@ -303,6 +524,37 @@ impl FuncHzRunner {
     }
 }
 
+impl MwSdtHzRunner {
+    async fn run(self) -> anyhow::Result<()> {
+        run_mw_sdt_hz_loop(
+            self.maps,
+            self.monitor_id,
+            &self.usdt_label,
+            &self.resolved_binary,
+            &self.cfg,
+            &self.runtime,
+            self.percentiles,
+        )
+        .await
+    }
+}
+
+impl MwSdtTraceRunner {
+    async fn run(self) -> anyhow::Result<()> {
+        run_mw_sdt_trace_loop(
+            self.ring,
+            self.monitor_id,
+            &self.usdt_label,
+            &self.resolved_binary,
+            &self.field_names,
+            &self.field_types,
+            &self.cfg,
+            &self.runtime,
+        )
+        .await
+    }
+}
+
 impl FuncLatencyRunner {
     async fn run(self) -> anyhow::Result<()> {
         run_func_latency_loop(
@@ -390,7 +642,7 @@ fn emit_event(runtime: &ServerRuntime, outputs: &[String], event: AlertEvent, th
     #[cfg(feature = "web")]
     if should_send("web", outputs) && runtime.outputs.web.enabled {
         if let Some(tx) = &runtime.web_tx {
-            let _ = tx.send(to_web_event(&event));
+            crate::web::push_event_async(tx, to_web_event(&event));
         }
     }
 
@@ -425,6 +677,40 @@ fn format_alert(alert: &AlertEvent) -> String {
                 "monitor={monitor} type=func_latency calls={calls} (+{delta}) avg_ns={avg_ns} interval_avg_ns={interval_avg_ns} interval_min_ns={} interval_max_ns={}",
                 opt_u64(*interval_min_ns),
                 opt_u64(*interval_max_ns)
+            )
+        }
+        AlertEvent::MwSdtHz {
+            monitor,
+            hits,
+            delta,
+            hz,
+            max_gap_ms,
+            hz_p1,
+            gap_p99_ms,
+            usdt,
+            ..
+        } => {
+            let tail = match (hz_p1, gap_p99_ms) {
+                (Some(p1), Some(p99)) => format!(" hz_p1={p1:.1} gap_p99_ms={p99:.3}"),
+                (Some(p1), None) => format!(" hz_p1={p1:.1}"),
+                (None, Some(p99)) => format!(" gap_p99_ms={p99:.3}"),
+                (None, None) => String::new(),
+            };
+            format!(
+                "monitor={monitor} type=mw_sdt_hz usdt={usdt} hits={hits} (+{delta}) hz={hz:.1} max_gap_ms={max_gap_ms:.3}{tail}"
+            )
+        }
+        AlertEvent::MwSdtTrace {
+            monitor,
+            usdt,
+            pid,
+            cpu,
+            fields,
+            ..
+        } => {
+            let fields_json = serde_json::to_string(fields).unwrap_or_default();
+            format!(
+                "monitor={monitor} type=mw_sdt_trace usdt={usdt} pid={pid} cpu={cpu} fields={fields_json}"
             )
         }
         AlertEvent::SchedLatency {
@@ -496,6 +782,48 @@ fn to_web_event(alert: &AlertEvent) -> crate::web::events::WebEvent {
             interval_min_ns: *interval_min_ns,
             interval_max_ns: *interval_max_ns,
         },
+        AlertEvent::MwSdtHz {
+            monitor,
+            ts,
+            binary,
+            usdt,
+            hits,
+            delta,
+            hz,
+            max_gap_ms,
+            hz_p1,
+            gap_p99_ms,
+            ..
+        } => crate::web::events::WebEvent::MwSdtHz {
+            monitor: monitor.clone(),
+            ts: ts.clone(),
+            binary: binary.clone(),
+            usdt: usdt.clone(),
+            hits: *hits,
+            delta: *delta,
+            hz: *hz,
+            max_gap_ms: *max_gap_ms,
+            hz_p1: *hz_p1,
+            gap_p99_ms: *gap_p99_ms,
+        },
+        AlertEvent::MwSdtTrace {
+            monitor,
+            ts,
+            binary,
+            usdt,
+            pid,
+            cpu,
+            fields,
+            ..
+        } => crate::web::events::WebEvent::MwSdtTrace {
+            monitor: monitor.clone(),
+            ts: ts.clone(),
+            binary: binary.clone(),
+            usdt: usdt.clone(),
+            pid: *pid,
+            cpu: *cpu,
+            fields: fields.clone(),
+        },
         AlertEvent::SchedLatency {
             monitor,
             wall_local,
@@ -514,6 +842,113 @@ fn to_web_event(alert: &AlertEvent) -> crate::web::events::WebEvent {
             prev_tid: *prev_tid,
             prev_comm: prev_comm.clone(),
         },
+    }
+}
+
+async fn run_mw_sdt_trace_loop(
+    ring: Arc<Mutex<RingBuf<MapData>>>,
+    monitor_id: u32,
+    usdt_label: &str,
+    resolved_binary: &str,
+    field_names: &[String],
+    field_types: &[MwSdtFieldType],
+    cfg: &MwSdtTraceConfig,
+    runtime: &ServerRuntime,
+) -> anyhow::Result<()> {
+    let mut poll = tokio::time::interval(Duration::from_millis(50));
+    poll.tick().await;
+    loop {
+        tokio::select! {
+            _ = poll.tick() => {
+                let mut rb = ring.lock().expect("MW_SDT_TRACE_EVENTS mutex");
+                while let Some(item) = rb.next() {
+                    if item.len() != mem::size_of::<MwSdtTraceEvent>() {
+                        continue;
+                    }
+                    let ev = unsafe { (item.as_ptr() as *const MwSdtTraceEvent).read_unaligned() };
+                    if ev.monitor_id != monitor_id {
+                        continue;
+                    }
+                    let fields = decode_trace_event(&ev, field_names, field_types);
+                    emit_event(
+                        runtime,
+                        &cfg.common.outputs,
+                        AlertEvent::MwSdtTrace {
+                            ts: Local::now().format("%H:%M:%S%.3f").to_string(),
+                            monitor: cfg.common.name.clone(),
+                            binary: resolved_binary.to_string(),
+                            usdt: usdt_label.to_string(),
+                            pid: ev.pid,
+                            cpu: ev.cpu,
+                            fields,
+                        },
+                        true,
+                    );
+                }
+            }
+        }
+    }
+}
+
+async fn run_mw_sdt_hz_loop(
+    maps: Arc<Mutex<MwSdtHzMaps>>,
+    monitor_id: u32,
+    usdt_label: &str,
+    resolved_binary: &str,
+    cfg: &MwSdtHzConfig,
+    runtime: &ServerRuntime,
+    mut percentiles: IntervalPercentileTracker,
+) -> anyhow::Result<()> {
+    let mut prev_total = 0u64;
+    let interval_secs = cfg.probe.interval_secs.max(1);
+    loop {
+        tokio::time::sleep(Duration::from_secs(interval_secs)).await;
+        let mut guard = maps.lock().expect("MW_SDT_HZ maps mutex");
+        let vals: PerCpuValues<FuncHzPerCpuPod> = guard
+            .hits
+            .get(&monitor_id, 0)
+            .with_context(|| format!("读取 MW_SDT_HZ_STATS[{monitor_id}] 失败"))?;
+        let total: u64 = vals.iter().map(|v| v.0.hits).sum();
+        let mut g = guard
+            .gap
+            .get(&monitor_id, 0)
+            .map_err(anyhow::Error::from)
+            .with_context(|| format!("读取 MW_SDT_HZ_GAP[{monitor_id}] 失败"))?;
+        let max_gap_ms = g.0.max_gap_ns as f64 / 1_000_000.0;
+        let delta = total.saturating_sub(prev_total);
+        let hz = delta as f64 / interval_secs as f64;
+        prev_total = total;
+
+        g.0.max_gap_ns = 0;
+        guard
+            .gap
+            .set(monitor_id, g, 0)
+            .map_err(anyhow::Error::from)
+            .with_context(|| format!("写回 MW_SDT_HZ_GAP[{monitor_id}] 失败"))?;
+        drop(guard);
+
+        percentiles.record_interval(hz, max_gap_ms);
+        let hz_p1 = percentiles.hz_p1();
+        let gap_p99_ms = percentiles.gap_p99_ms();
+
+        let threshold_met = func_hz_alert_thresholds(&cfg.thresholds, delta, max_gap_ms);
+        emit_event(
+            runtime,
+            &cfg.common.outputs,
+            AlertEvent::MwSdtHz {
+                ts: Local::now().format("%H:%M:%S").to_string(),
+                monitor: cfg.common.name.clone(),
+                binary: resolved_binary.to_string(),
+                usdt: usdt_label.to_string(),
+                hits: total,
+                delta,
+                hz,
+                max_gap_ms,
+                hz_p1,
+                gap_p99_ms,
+            },
+            threshold_met,
+        );
     }
 }
 
@@ -538,7 +973,7 @@ async fn run_func_hz_loop(
         let delta = total.saturating_sub(prev_total);
         prev_total = total;
 
-        let threshold_met = func_hz_alert(&cfg, delta, max_gap_ms);
+        let threshold_met = func_hz_alert_thresholds(&cfg.thresholds, delta, max_gap_ms);
         emit_event(
             &runtime,
             &cfg.common.outputs,
@@ -586,15 +1021,19 @@ fn attach_func_hz(ebpf: &mut Ebpf, cfg: &FuncProbeConfig) -> anyhow::Result<Stri
     Ok(attach_symbol)
 }
 
-fn func_hz_alert(cfg: &FuncHzConfig, delta: u64, max_gap_ms: f64) -> bool {
+fn func_hz_alert_thresholds(
+    thresholds: &crate::config::FuncHzThresholds,
+    delta: u64,
+    max_gap_ms: f64,
+) -> bool {
     let mut has_threshold = false;
-    if let Some(min_delta) = cfg.thresholds.min_delta {
+    if let Some(min_delta) = thresholds.min_delta {
         has_threshold = true;
         if delta >= min_delta {
             return true;
         }
     }
-    if let Some(max_gap) = cfg.thresholds.max_gap_ms {
+    if let Some(max_gap) = thresholds.max_gap_ms {
         has_threshold = true;
         if max_gap_ms >= max_gap {
             return true;

@@ -14,6 +14,9 @@ header h1 { font-size: 18px; color: #58a6ff; }
 .connected { background: #238636; color: #fff; }
 .disconnected { background: #da3633; color: #fff; }
 #visible-summary { font-size: 12px; color: #8b949e; margin-left: auto; max-width: 40%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.header-actions { display: flex; gap: 8px; margin-left: 8px; }
+.header-actions button { background: #21262d; border: 1px solid #30363d; color: #c9d1d9; border-radius: 6px; padding: 4px 10px; font-size: 12px; cursor: pointer; font-family: inherit; }
+.header-actions button:hover { background: #30363d; border-color: #484f58; }
 .layout { display: flex; min-height: calc(100vh - 49px); }
 #monitor-picker { width: 240px; flex-shrink: 0; background: #161b22; border-right: 1px solid #30363d; padding: 16px 12px; overflow-y: auto; }
 .picker-title { font-size: 12px; color: #8b949e; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 10px; }
@@ -56,6 +59,9 @@ th { color: #8b949e; font-weight: 600; position: sticky; top: 0; background: #16
 <header>
   <h1>RocketEbpf</h1>
   <span id="status" class="disconnected">Disconnected</span>
+  <div class="header-actions">
+    <button type="button" id="btn-clear-display" title="清空图表与表格，不影响 SSE 连接">清除显示</button>
+  </div>
   <span id="visible-summary"></span>
 </header>
 <div class="layout">
@@ -92,6 +98,58 @@ th { color: #8b949e; font-weight: 600; position: sticky; top: 0; background: #16
       <div class="card">
         <h2>Max Gap ms (time series)</h2>
         <div class="chart-container"><canvas id="hz-chart-gap"></canvas></div>
+      </div>
+    </div>
+
+    <div id="panel-MwSdtHz" class="monitor-panel" data-type="MwSdtHz">
+      <div class="panel-title" id="title-MwSdtHz">mw_sdt hz</div>
+      <div class="target-info">
+        <span><span class="ti-label">Binary:</span><span class="ti-value" id="msdt-bin">-</span></span>
+        <span><span class="ti-label">USDT:</span><span class="ti-value" id="msdt-usdt">-</span></span>
+      </div>
+      <div class="card">
+        <h2>Overview</h2>
+        <div class="stats">
+          <div class="stat"><div class="label">Total Hits</div><div class="value" id="msdt-total">0</div></div>
+          <div class="stat"><div class="label">Interval Delta</div><div class="value" id="msdt-delta">0</div></div>
+          <div class="stat"><div class="label">Hz</div><div class="value" id="msdt-hz">0</div></div>
+          <div class="stat"><div class="label">Max Gap (ms)</div><div class="value" id="msdt-gap">0</div></div>
+          <div class="stat"><div class="label">Hz P1 (low)</div><div class="value" id="msdt-hz-p1">-</div></div>
+          <div class="stat"><div class="label">Gap P99 (ms)</div><div class="value" id="msdt-gap-p99">-</div></div>
+        </div>
+      </div>
+      <div class="card">
+        <h2>Hz (time series)</h2>
+        <div class="chart-container"><canvas id="msdt-chart-hz"></canvas></div>
+      </div>
+      <div class="card">
+        <h2>Max Gap ms (time series)</h2>
+        <div class="chart-container"><canvas id="msdt-chart-gap"></canvas></div>
+      </div>
+      <div class="card">
+        <h2>Gap P99 ms (time series)</h2>
+        <div class="chart-container"><canvas id="msdt-chart-gap-p99"></canvas></div>
+      </div>
+      <div class="card">
+        <h2>Hz P1 low (time series)</h2>
+        <div class="chart-container"><canvas id="msdt-chart-hz-p1"></canvas></div>
+      </div>
+    </div>
+
+    <div id="panel-MwSdtTrace" class="monitor-panel" data-type="MwSdtTrace">
+      <div class="panel-title" id="title-MwSdtTrace">mw_sdt trace</div>
+      <div class="target-info">
+        <span><span class="ti-label">Binary:</span><span class="ti-value" id="mst-bin">-</span></span>
+        <span><span class="ti-label">USDT:</span><span class="ti-value" id="mst-usdt">-</span></span>
+      </div>
+      <div class="card">
+        <h2>Recent Events</h2>
+        <div class="event-table-wrap">
+          <table>
+            <thead><tr><th>Time</th><th>PID</th><th>CPU</th><th>Fields</th></tr></thead>
+            <tbody id="mst-tbody"></tbody>
+          </table>
+        </div>
       </div>
     </div>
 
@@ -153,6 +211,8 @@ const TYPE_LABELS = {
   FuncHz: 'func hz',
   FuncLatency: 'func latency',
   SchedLatency: 'sched latency',
+  MwSdtHz: 'mw_sdt hz',
+  MwSdtTrace: 'mw_sdt trace',
 };
 
 /** @type {Map<string, {type: string, visible: boolean}>} */
@@ -191,6 +251,75 @@ function pushHzData(ev) {
   initHzCharts();
   pushChartPoint(hzDeltaChart, ev.ts, ev.delta);
   pushChartPoint(hzGapChart, ev.ts, ev.max_gap_ms);
+}
+
+const msdtHzCtx = document.getElementById('msdt-chart-hz');
+const msdtGapCtx = document.getElementById('msdt-chart-gap');
+const msdtGapP99Ctx = document.getElementById('msdt-chart-gap-p99');
+const msdtHzP1Ctx = document.getElementById('msdt-chart-hz-p1');
+let msdtHzChart, msdtGapChart, msdtGapP99Chart, msdtHzP1Chart;
+
+function fmtMetric(v, digits) {
+  if (typeof v !== 'number' || !Number.isFinite(v)) return '-';
+  return v.toFixed(digits);
+}
+
+function initMsdtCharts() {
+  if (msdtHzChart) return;
+  const lineOpts = { responsive: true, maintainAspectRatio: false, animation: false, scales: { y: { beginAtZero: true } } };
+  msdtHzChart = new Chart(msdtHzCtx, {
+    type: 'line',
+    data: { labels: [], datasets: [{ label: 'hz', data: [], borderColor: '#58a6ff', borderWidth: 2, pointRadius: 0, fill: false, tension: 0.2 }] },
+    options: lineOpts
+  });
+  msdtGapChart = new Chart(msdtGapCtx, {
+    type: 'line',
+    data: { labels: [], datasets: [{ label: 'max_gap_ms', data: [], borderColor: '#f0883e', borderWidth: 2, pointRadius: 0, fill: false, tension: 0.2 }] },
+    options: lineOpts
+  });
+  msdtGapP99Chart = new Chart(msdtGapP99Ctx, {
+    type: 'line',
+    data: { labels: [], datasets: [{ label: 'gap_p99_ms', data: [], borderColor: '#d29922', borderWidth: 2, pointRadius: 0, fill: false, tension: 0.2 }] },
+    options: lineOpts
+  });
+  msdtHzP1Chart = new Chart(msdtHzP1Ctx, {
+    type: 'line',
+    data: { labels: [], datasets: [{ label: 'hz_p1', data: [], borderColor: '#a371f7', borderWidth: 2, pointRadius: 0, fill: false, tension: 0.2 }] },
+    options: lineOpts
+  });
+}
+
+function pushMwSdtTraceData(ev) {
+  if (ev.binary) document.getElementById('mst-bin').textContent = ev.binary;
+  if (ev.usdt) document.getElementById('mst-usdt').textContent = ev.usdt;
+  const tbody = document.getElementById('mst-tbody');
+  const tr = document.createElement('tr');
+  const fields = ev.fields ? JSON.stringify(ev.fields) : '{}';
+  tr.innerHTML = `<td>${escapeHtml(ev.ts || '')}</td><td>${ev.pid ?? ''}</td><td>${ev.cpu ?? ''}</td><td>${escapeHtml(fields)}</td>`;
+  tbody.insertBefore(tr, tbody.firstChild);
+  while (tbody.children.length > MAX_TABLE_ROWS) tbody.removeChild(tbody.lastChild);
+}
+
+function pushMwSdtHzData(ev) {
+  if (ev.binary) document.getElementById('msdt-bin').textContent = ev.binary;
+  if (ev.usdt) document.getElementById('msdt-usdt').textContent = ev.usdt;
+  document.getElementById('msdt-total').textContent = ev.hits;
+  document.getElementById('msdt-delta').textContent = ev.delta;
+  document.getElementById('msdt-hz').textContent = fmtMetric(ev.hz, 1);
+  document.getElementById('msdt-gap').textContent = fmtMetric(ev.max_gap_ms, 3);
+  const hzP1 = ev.hz_p1;
+  const gapP99 = ev.gap_p99_ms;
+  document.getElementById('msdt-hz-p1').textContent = fmtMetric(hzP1, 1);
+  document.getElementById('msdt-gap-p99').textContent = fmtMetric(gapP99, 3);
+  initMsdtCharts();
+  pushChartPoint(msdtHzChart, ev.ts, ev.hz);
+  pushChartPoint(msdtGapChart, ev.ts, ev.max_gap_ms);
+  if (typeof gapP99 === 'number' && Number.isFinite(gapP99)) {
+    pushChartPoint(msdtGapP99Chart, ev.ts, gapP99);
+  }
+  if (typeof hzP1 === 'number' && Number.isFinite(hzP1)) {
+    pushChartPoint(msdtHzP1Chart, ev.ts, hzP1);
+  }
 }
 
 const latCtx = document.getElementById('lat-chart');
@@ -268,6 +397,7 @@ function pushSchedData(ev) {
 }
 
 function pushChartPoint(chart, label, value, dsIdx) {
+  if (!chart) return;
   dsIdx = dsIdx || 0;
   if (label !== null) chart.data.labels.push(label);
   chart.data.datasets[dsIdx].data.push(value);
@@ -275,7 +405,53 @@ function pushChartPoint(chart, label, value, dsIdx) {
     chart.data.labels.shift();
     chart.data.datasets.forEach(ds => ds.data.shift());
   }
-  if (dsIdx === 0 || label !== null) chart.update();
+  if (dsIdx === 0 || label !== null) chart.update('none');
+}
+
+function clearChart(chart) {
+  if (!chart) return;
+  chart.data.labels = [];
+  chart.data.datasets.forEach(ds => { ds.data = []; });
+  chart.update('none');
+}
+
+function setText(id, text) {
+  const el = document.getElementById(id);
+  if (el) el.textContent = text;
+}
+
+function clearAllDisplay() {
+  schedCount = 0;
+  schedMax = 0;
+  schedHistCounts.fill(0);
+
+  [
+    'hz-total', 'hz-delta', 'hz-gap',
+    'msdt-total', 'msdt-delta', 'msdt-hz', 'msdt-gap', 'msdt-hz-p1', 'msdt-gap-p99',
+    'lat-calls', 'lat-avg', 'lat-iavg', 'lat-imin', 'lat-imax',
+    'sched-count', 'sched-max', 'sched-last',
+  ].forEach(id => setText(id, '0'));
+  ['hz-lib', 'hz-sym', 'msdt-bin', 'msdt-usdt', 'lat-lib', 'lat-sym'].forEach(id => setText(id, '-'));
+  setText('msdt-hz-p1', '-');
+  setText('msdt-gap-p99', '-');
+  setText('lat-imin', 'n/a');
+  setText('lat-imax', 'n/a');
+
+  ['mst-tbody', 'sched-tbody'].forEach(id => {
+    const tbody = document.getElementById(id);
+    if (tbody) tbody.innerHTML = '';
+  });
+
+  [
+    hzDeltaChart, hzGapChart,
+    msdtHzChart, msdtGapChart, msdtGapP99Chart, msdtHzP1Chart,
+    latChart, schedHistChart,
+  ].forEach(clearChart);
+
+  if (schedHistChart) {
+    schedHistChart.data.datasets[0].data = [...schedHistCounts];
+    schedHistChart.update('none');
+  }
 }
 
 function safeId(name) {
@@ -388,6 +564,7 @@ function setAllVisible(visible) {
 
 document.getElementById('btn-show-all').addEventListener('click', () => setAllVisible(true));
 document.getElementById('btn-hide-all').addEventListener('click', () => setAllVisible(false));
+document.getElementById('btn-clear-display').addEventListener('click', () => clearAllDisplay());
 
 function handleEvent(ev) {
   const type = ev.type;
@@ -396,6 +573,10 @@ function handleEvent(ev) {
 
   if (type === 'FuncHz') {
     pushHzData(ev);
+  } else if (type === 'MwSdtHz') {
+    pushMwSdtHzData(ev);
+  } else if (type === 'MwSdtTrace') {
+    pushMwSdtTraceData(ev);
   } else if (type === 'FuncLatency') {
     pushLatData(ev);
   } else if (type === 'SchedLatency') {

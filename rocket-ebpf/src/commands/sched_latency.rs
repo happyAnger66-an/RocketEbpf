@@ -249,7 +249,7 @@ pub async fn run(
 
                         #[cfg(feature = "web")]
                         if let Some(tx) = &web_tx {
-                            let _ = tx.send(crate::web::events::WebEvent::SchedLatency {
+                            crate::web::push_event_async(tx, crate::web::events::WebEvent::SchedLatency {
                                 monitor: web_monitor.clone(),
                                 wall_local: wall_local.clone(),
                                 tid: ev.tid,
@@ -268,7 +268,7 @@ pub async fn run(
 
                         #[cfg(feature = "web")]
                         if let Some(tx) = &web_tx {
-                            let _ = tx.send(crate::web::events::WebEvent::SchedLatency {
+                            crate::web::push_event_async(tx, crate::web::events::WebEvent::SchedLatency {
                                 monitor: web_monitor.clone(),
                                 wall_local: wall_local.clone(),
                                 tid: ev.tid,

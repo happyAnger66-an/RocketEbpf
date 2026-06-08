@@ -1,0 +1,59 @@
+# MW_SDT / USDT 频率监控示例
+# 用法：
+#   rocket-ebpf server --config configs/server.mw_sdt.example.yaml --check
+#   sudo rocket-ebpf server --config configs/server.mw_sdt.example.yaml
+
+server:
+  web:
+    enabled: true
+    listen: "0.0.0.0:8080"
+
+outputs:
+  console:
+    enabled: true
+  log:
+    enabled: false
+    path: /tmp/rocket-ebpf-mw-sdt.jsonl
+  web:
+    enabled: true
+
+monitors:
+  - type: mw_sdt_hz
+    name: trro_gw-recv_ctrl-hz
+    enabled: false
+    # 含 MW_SDT 的二进制或 .so（推荐绝对路径）
+    binary: /home/wujie/codes/grid-merge/anyverse/.ws/build/trro_gateway/libtrro_gateway_core.so
+    provider: trro_gw
+    probe: recv_ctrl
+    # pid 可选：省略或写 null → 不限制进程，监控所有命中该 USDT 的进程
+    # pid: 12345
+    interval_secs: 1
+    thresholds: {}
+    outputs: [console, web]
+  
+  - type: mw_sdt_hz
+    name: trro_gw-pub_ctrl-hz
+    enabled: false
+    # 含 MW_SDT 的二进制或 .so（推荐绝对路径）
+    binary: /home/wujie/codes/grid-merge/anyverse/.ws/build/trro_gateway/libtrro_gateway_core.so
+    provider: trro_gw
+    probe: ctrl_publish
+    # pid 可选：省略或写 null → 不限制进程，监控所有命中该 USDT 的进程
+    # pid: 12345
+    interval_secs: 1
+    thresholds: {}
+    outputs: [console, web]
+
+  # 字段采样：读取 MW_SDT 参数值
+  - type: mw_sdt_trace
+    name: trro-video-capture-latency-trace
+    enabled: true
+    binary: /home/wujie/codes/grid-merge/anyverse/.ws/build/trro_gateway/libtrro_gateway_core.so
+    provider: trro_gw
+    probe: video_capture_latency
+    # pid: null   # 同上，不写则监控全系统
+    sample_rate: 1
+    fields:
+      - { index: 0, name: stream_id, type: int64 }
+      - { index: 3, name: latency, type: int64 }
+    outputs: [console, web]

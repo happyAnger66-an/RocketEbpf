@@ -78,3 +78,11 @@ async fn sse_handler(
 
     Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
 }
+
+/// 非阻塞推送：监控循环仅构造 `WebEvent` 并 spawn 发送；JSON 在 SSE 消费端序列化。
+pub fn push_event_async(tx: &broadcast::Sender<WebEvent>, event: WebEvent) {
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let _ = tx.send(event);
+    });
+}

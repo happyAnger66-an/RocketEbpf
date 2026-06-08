@@ -56,6 +56,16 @@ pub enum Commands {
         long_about = "读取配置文件并启动常驻监控服务。每个监控项独立加载一份 eBPF 对象，以避免第一阶段中聚合 map 多实例混淆。"
     )]
     Server(ServerArgs),
+
+    /// MW_SDT / USDT 静态探测点（stapsdt）
+    #[command(
+        name = "mw_sdt",
+        aliases = ["mw-sdt"],
+        subcommand,
+        long_about = "解析 ELF .note.stapsdt 探测点并附加 uprobe。\n\
+参数位置信息已编码在 MW_SDT 编译产物中，无需区分 x86/aarch64。\n一般需 root 或 CAP_PERFMON 等权限。"
+    )]
+    MwSdt(MwSdtCmd),
 }
 
 #[derive(Debug, Subcommand)]
@@ -109,6 +119,52 @@ pub struct FuncProbeArgs {
     /// 打印间隔（秒）
     #[arg(long, default_value_t = 1)]
     pub interval: u64,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum MwSdtCmd {
+    /// 列出二进制内所有 USDT 探测点（provider:probe）
+    List {
+        /// 可执行文件或共享库路径（推荐绝对路径）
+        binary: std::path::PathBuf,
+    },
+    /// 统计 USDT 探测点命中频率（hits / delta / hz / max_gap_ms）
+    Hz(MwSdtHzArgs),
+    /// 采样 USDT 探测点参数并输出配置字段
+    Trace(MwSdtTraceArgs),
+}
+
+/// `mw_sdt hz` 参数。
+#[derive(Debug, Parser)]
+pub struct MwSdtHzArgs {
+    /// 含 MW_SDT 的可执行文件或共享库路径
+    pub binary: std::path::PathBuf,
+    /// USDT 规格：`provider:probe`，例如 `rmw:rmw_publish`
+    pub usdt: String,
+    /// 仅统计该 PID（线程组 leader）
+    #[arg(long)]
+    pub pid: Option<u32>,
+    /// 打印间隔（秒）
+    #[arg(long, default_value_t = 1)]
+    pub interval: u64,
+}
+
+/// `mw_sdt trace` 参数。
+#[derive(Debug, Parser)]
+pub struct MwSdtTraceArgs {
+    /// 含 MW_SDT 的可执行文件或共享库路径
+    pub binary: std::path::PathBuf,
+    /// USDT 规格：`provider:probe`
+    pub usdt: String,
+    /// 仅统计该 PID
+    #[arg(long)]
+    pub pid: Option<u32>,
+    /// 采样率：每 N 次命中采 1 次
+    #[arg(long, default_value_t = 1)]
+    pub sample_rate: u32,
+    /// 字段：`INDEX:TYPE:NAME`，可重复；TYPE 为 int64/uint64/string/hex_ptr
+    #[arg(long = "field", value_name = "INDEX:TYPE:NAME")]
+    pub fields: Vec<String>,
 }
 
 /// `server` 参数：配置文件与校验模式。

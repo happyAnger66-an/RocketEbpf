@@ -5,6 +5,7 @@ use aya_ebpf::{
     helpers::{
         bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_smp_processor_id, bpf_ktime_get_ns,
         bpf_probe_read_kernel, bpf_probe_read_kernel_buf, bpf_probe_read_kernel_str_bytes,
+        bpf_probe_read_user_str_bytes,
     },
     macros::{map, tracepoint, uprobe, uretprobe},
     maps::{Array, HashMap, PerCpuArray, RingBuf},
@@ -13,7 +14,9 @@ use aya_ebpf::{
 };
 use aya_log_ebpf::info;
 use rocket_ebpf_common::{
-    FuncHzGlobalGap, FuncHzPerCpu, FuncLatencyAgg, SchedLatConfig, SchedLatEvent,
+    FuncHzGlobalGap, FuncHzPerCpu, FuncLatencyAgg, MwSdtFieldSlot, MwSdtFieldSpec, MwSdtTraceCfg,
+    MwSdtTraceEvent, SchedLatConfig, SchedLatEvent, MW_SDT_FIELD_HEX_PTR, MW_SDT_FIELD_INT64,
+    MW_SDT_FIELD_STRING, MW_SDT_FIELD_UINT64, MW_SDT_MAX_MONITORS, MW_SDT_STR_MAX,
 };
 
 /// `sched:sched_process_exec` 的 trace 记录布局（`struct trace_entry` 8 字节后）：
@@ -47,6 +50,38 @@ static FUNC_HZ_STATS: PerCpuArray<FuncHzPerCpu> = PerCpuArray::with_max_entries(
 /// `func hz`：全局相邻两次命中（任意 CPU）之间的最大间隔（ns）
 #[map]
 static FUNC_HZ_GAP: Array<FuncHzGlobalGap> = Array::with_max_entries(1, 0);
+
+/// `mw_sdt hz`：每 monitor_id 的每 CPU 命中数
+#[map]
+static MW_SDT_HZ_STATS: PerCpuArray<FuncHzPerCpu> =
+    PerCpuArray::with_max_entries(MW_SDT_MAX_MONITORS as u32, 0);
+
+/// `mw_sdt hz`：每 monitor_id 的相邻命中间隔峰值（ns）
+#[map]
+static MW_SDT_HZ_GAP: Array<FuncHzGlobalGap> = Array::with_max_entries(MW_SDT_MAX_MONITORS as u32, 0);
+
+/// `mw_sdt trace`：字段配置（用户态按 monitor_id 写入）
+#[map]
+static MW_SDT_TRACE_CFG: Array<MwSdtTraceCfg> = Array::with_max_entries(MW_SDT_MAX_MONITORS as u32, 0);
+
+/// `mw_sdt trace`：采样计数（每 monitor_id）
+#[map]
+static MW_SDT_TRACE_SAMPLE: PerCpuArray<u64> =
+    PerCpuArray::with_max_entries(MW_SDT_MAX_MONITORS as u32, 0);
+
+/// `mw_sdt trace`：RingBuf 丢弃计数（每 monitor_id）
+#[map]
+static MW_SDT_TRACE_DROPS: PerCpuArray<u64> =
+    PerCpuArray::with_max_entries(MW_SDT_MAX_MONITORS as u32, 0);
+
+/// `mw_sdt trace`：事件构建暂存（避免 BPF 栈溢出，按 monitor_id）
+#[map]
+static MW_SDT_TRACE_SCRATCH: PerCpuArray<MwSdtTraceEvent> =
+    PerCpuArray::with_max_entries(MW_SDT_MAX_MONITORS as u32, 0);
+
+/// `mw_sdt trace`：字段采样事件
+#[map]
+static MW_SDT_TRACE_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 4096, 0);
 
 /// 函数延迟：`tgid<<32|tid` -> 入口 `bpf_ktime_get_ns`
 #[map]
@@ -237,6 +272,177 @@ fn try_sched_lat_switch(ctx: TracePointContext) -> Result<u32, u32> {
     let _ = SCHED_LAT_EVENTS.output(&ev, 0);
     Ok(0)
 }
+
+fn read_mw_sdt_field(ctx: &ProbeContext, spec: &MwSdtFieldSpec, slot: &mut MwSdtFieldSlot) {
+    *slot = MwSdtFieldSlot::default();
+    let idx = spec.arg_index as usize;
+    match spec.field_type {
+        MW_SDT_FIELD_INT64 => {
+            if let Some(v) = ctx.arg::<i64>(idx) {
+                slot.kind = MW_SDT_FIELD_INT64;
+                slot.i64 = v;
+            }
+        }
+        MW_SDT_FIELD_UINT64 => {
+            if let Some(v) = ctx.arg::<u64>(idx) {
+                slot.kind = MW_SDT_FIELD_UINT64;
+                slot.i64 = v as i64;
+            }
+        }
+        MW_SDT_FIELD_HEX_PTR => {
+            if let Some(v) = ctx.arg::<u64>(idx) {
+                slot.kind = MW_SDT_FIELD_HEX_PTR;
+                slot.i64 = v as i64;
+            }
+        }
+        MW_SDT_FIELD_STRING => {
+            let Some(ptr) = ctx.arg::<*const u8>(idx) else {
+                return;
+            };
+            if ptr.is_null() {
+                return;
+            }
+            slot.kind = MW_SDT_FIELD_STRING;
+            let mut cap = spec.max_len as usize;
+            if cap == 0 || cap > MW_SDT_STR_MAX {
+                cap = MW_SDT_STR_MAX;
+            }
+            let buf = &mut slot.str_buf[..cap];
+            if unsafe { bpf_probe_read_user_str_bytes(ptr, buf) }.is_ok() {
+                // str_buf 已由 helper 写入
+            }
+        }
+        _ => {}
+    }
+}
+
+fn try_mw_sdt_trace_hit(ctx: ProbeContext, monitor_id: u32) -> Result<u32, u32> {
+    let cfg_ptr = match MW_SDT_TRACE_CFG.get(monitor_id) {
+        Some(p) => p,
+        None => return Ok(0),
+    };
+    let cfg = unsafe { *cfg_ptr };
+    if cfg.n_fields == 0 {
+        return Ok(0);
+    }
+
+    let rate = cfg.sample_rate.max(1) as u64;
+    if let Some(c) = MW_SDT_TRACE_SAMPLE.get_ptr_mut(monitor_id) {
+        unsafe {
+            *c = (*c).wrapping_add(1);
+            if (*c) % rate != 0 {
+                return Ok(0);
+            }
+        }
+    }
+
+    let ev_ptr = match MW_SDT_TRACE_SCRATCH.get_ptr_mut(monitor_id) {
+        Some(p) => p,
+        None => return Ok(0),
+    };
+    unsafe {
+        let ev = &mut *ev_ptr;
+        ev.ktime_ns = bpf_ktime_get_ns();
+        ev.pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+        ev.cpu = bpf_get_smp_processor_id();
+        ev.monitor_id = monitor_id;
+        ev.n_fields = cfg.n_fields;
+        ev._pad = [0; 3];
+
+        if cfg.n_fields > 0 {
+            read_mw_sdt_field(&ctx, &cfg.fields[0], &mut ev.fields[0]);
+        }
+        if cfg.n_fields > 1 {
+            read_mw_sdt_field(&ctx, &cfg.fields[1], &mut ev.fields[1]);
+        }
+        if cfg.n_fields > 2 {
+            read_mw_sdt_field(&ctx, &cfg.fields[2], &mut ev.fields[2]);
+        }
+        if cfg.n_fields > 3 {
+            read_mw_sdt_field(&ctx, &cfg.fields[3], &mut ev.fields[3]);
+        }
+        if cfg.n_fields > 4 {
+            read_mw_sdt_field(&ctx, &cfg.fields[4], &mut ev.fields[4]);
+        }
+        if cfg.n_fields > 5 {
+            read_mw_sdt_field(&ctx, &cfg.fields[5], &mut ev.fields[5]);
+        }
+        if cfg.n_fields > 6 {
+            read_mw_sdt_field(&ctx, &cfg.fields[6], &mut ev.fields[6]);
+        }
+        if cfg.n_fields > 7 {
+            read_mw_sdt_field(&ctx, &cfg.fields[7], &mut ev.fields[7]);
+        }
+
+        if MW_SDT_TRACE_EVENTS.output(ev, 0).is_err() {
+            if let Some(d) = MW_SDT_TRACE_DROPS.get_ptr_mut(monitor_id) {
+                *d = (*d).wrapping_add(1);
+            }
+        }
+    }
+    Ok(0)
+}
+
+fn mw_sdt_hz_hit_impl(monitor_id: u32) {
+    let now = unsafe { bpf_ktime_get_ns() };
+    if let Some(p) = MW_SDT_HZ_STATS.get_ptr_mut(monitor_id) {
+        unsafe {
+            (*p).hits = (*p).hits.wrapping_add(1);
+        }
+    }
+    if let Some(g) = MW_SDT_HZ_GAP.get_ptr_mut(monitor_id) {
+        unsafe {
+            let a = &mut *g;
+            if a.last_ts_ns != 0 {
+                let gap = now.saturating_sub(a.last_ts_ns);
+                if gap > a.max_gap_ns {
+                    a.max_gap_ns = gap;
+                }
+            }
+            a.last_ts_ns = now;
+        }
+    }
+}
+
+macro_rules! mw_sdt_hz_hit_slot {
+    ($id:expr, $name:ident) => {
+        #[uprobe]
+        pub fn $name(_ctx: ProbeContext) -> u32 {
+            mw_sdt_hz_hit_impl($id);
+            0
+        }
+    };
+}
+
+macro_rules! mw_sdt_trace_hit_slot {
+    ($id:expr, $name:ident) => {
+        #[uprobe]
+        pub fn $name(ctx: ProbeContext) -> u32 {
+            match try_mw_sdt_trace_hit(ctx, $id) {
+                Ok(v) => v,
+                Err(v) => v,
+            }
+        }
+    };
+}
+
+mw_sdt_hz_hit_slot!(0, mw_sdt_hz_hit_0);
+mw_sdt_hz_hit_slot!(1, mw_sdt_hz_hit_1);
+mw_sdt_hz_hit_slot!(2, mw_sdt_hz_hit_2);
+mw_sdt_hz_hit_slot!(3, mw_sdt_hz_hit_3);
+mw_sdt_hz_hit_slot!(4, mw_sdt_hz_hit_4);
+mw_sdt_hz_hit_slot!(5, mw_sdt_hz_hit_5);
+mw_sdt_hz_hit_slot!(6, mw_sdt_hz_hit_6);
+mw_sdt_hz_hit_slot!(7, mw_sdt_hz_hit_7);
+
+mw_sdt_trace_hit_slot!(0, mw_sdt_trace_hit_0);
+mw_sdt_trace_hit_slot!(1, mw_sdt_trace_hit_1);
+mw_sdt_trace_hit_slot!(2, mw_sdt_trace_hit_2);
+mw_sdt_trace_hit_slot!(3, mw_sdt_trace_hit_3);
+mw_sdt_trace_hit_slot!(4, mw_sdt_trace_hit_4);
+mw_sdt_trace_hit_slot!(5, mw_sdt_trace_hit_5);
+mw_sdt_trace_hit_slot!(6, mw_sdt_trace_hit_6);
+mw_sdt_trace_hit_slot!(7, mw_sdt_trace_hit_7);
 
 #[uprobe]
 pub fn func_hz_hit(_ctx: ProbeContext) -> u32 {

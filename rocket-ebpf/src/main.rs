@@ -4,6 +4,8 @@ mod config;
 mod cxx_symbol;
 mod ebpf;
 mod server;
+mod stats;
+mod usdt;
 #[cfg(feature = "web")]
 mod web;
 
@@ -24,11 +26,20 @@ async fn main() -> anyhow::Result<()> {
         command,
     } = cli::Cli::parse();
 
-    let command = match command {
-        cli::Commands::Server(args) => return server::run(args).await,
-        other => other,
-    };
+    match command {
+        cli::Commands::Server(args) => server::run(args).await,
+        cli::Commands::MwSdt(cli::MwSdtCmd::List { binary }) => {
+            commands::run_mw_sdt_list(binary)
+        }
+        cmd => run_with_ebpf(cmd, web, web_port).await,
+    }
+}
 
+async fn run_with_ebpf(
+    command: cli::Commands,
+    web: bool,
+    web_port: u16,
+) -> anyhow::Result<()> {
     let mut ebpf = ebpf::load_and_init_logger()?;
 
     #[cfg(feature = "web")]
@@ -62,6 +73,14 @@ async fn main() -> anyhow::Result<()> {
                 commands::run_sched_latency(&mut ebpf, args, web_tx).await
             }
         },
-        cli::Commands::Server(_) => unreachable!("server command returned before loading eBPF"),
+        cli::Commands::MwSdt(cli::MwSdtCmd::Hz(args)) => {
+            commands::run_mw_sdt_hz(&mut ebpf, args, web_tx).await
+        }
+        cli::Commands::MwSdt(cli::MwSdtCmd::Trace(args)) => {
+            commands::run_mw_sdt_trace(&mut ebpf, args, web_tx).await
+        }
+        cli::Commands::Server(_) | cli::Commands::MwSdt(cli::MwSdtCmd::List { .. }) => {
+            unreachable!("handled in main before eBPF load")
+        }
     }
 }

@@ -34,4 +34,49 @@ pub enum WebEvent {
         prev_tid: Option<u32>,
         prev_comm: Option<String>,
     },
+    MwSdtHz {
+        monitor: String,
+        ts: String,
+        binary: String,
+        usdt: String,
+        hits: u64,
+        delta: u64,
+        hz: f64,
+        max_gap_ms: f64,
+        hz_p1: Option<f64>,
+        gap_p99_ms: Option<f64>,
+    },
+    MwSdtTrace {
+        monitor: String,
+        ts: String,
+        binary: String,
+        usdt: String,
+        pid: u32,
+        cpu: u32,
+        fields: std::collections::HashMap<String, String>,
+    },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mw_sdt_hz_serializes_percentile_fields() {
+        let ev = WebEvent::MwSdtHz {
+            monitor: "test".into(),
+            ts: "12:00:00".into(),
+            binary: "/tmp/a.so".into(),
+            usdt: "p:probe".into(),
+            hits: 10,
+            delta: 2,
+            hz: 2.0,
+            max_gap_ms: 1.5,
+            hz_p1: Some(0.5),
+            gap_p99_ms: Some(42.0),
+        };
+        let json = serde_json::to_string(&ev).expect("json");
+        assert!(json.contains("\"hz_p1\":0.5"), "json={json}");
+        assert!(json.contains("\"gap_p99_ms\":42"), "json={json}");
+    }
 }

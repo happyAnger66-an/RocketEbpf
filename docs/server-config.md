@@ -80,7 +80,7 @@ monitors: []
 
 | 字段 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
-| `type` | string | 无 | 监控类型，当前支持 `sched_latency`、`func_latency`、`func_hz` |
+| `type` | string | 无 | 监控类型，当前支持 `sched_latency`、`func_latency`、`func_hz`、`mw_sdt_hz` |
 | `name` | string | `""` | 监控项名称；不能为空，且不能重复 |
 | `enabled` | bool | `true` | 是否启用该监控项 |
 | `outputs` | array[string] | `["console"]` | 超过阈值或产生事件时的输出方向 |
@@ -179,6 +179,74 @@ monitors: []
 
 如果 `thresholds` 为空或阈值都为 `null`，每个周期都会在 console/log 输出。配置阈值后，**仅 console/log 受阈值约束**；**Web UI 每个周期都会收到指标**。
 
+## `mw_sdt_hz`
+
+统计 MW_SDT / USDT（`.note.stapsdt`）探测点命中频率。参数位置信息已编码在 ELF note 中，配置无需区分架构。
+
+```json
+{
+  "type": "mw_sdt_hz",
+  "name": "rmw-publish-hz",
+  "enabled": true,
+  "binary": "/opt/ros/lib/librmw_cyclonedds_cpp.so",
+  "provider": "rmw",
+  "probe": "rmw_publish",
+  "pid": 12345,
+  "interval_secs": 1,
+  "thresholds": {
+    "min_delta": 100,
+    "max_gap_ms": 500
+  },
+  "outputs": ["console", "web"]
+}
+```
+
+| 字段 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `binary` | string | `""` | 含 MW_SDT 的可执行文件或共享库路径 |
+| `provider` | string | `""` | USDT provider（MW_SDT 第一个参数） |
+| `probe` | string | `""` | USDT probe name（MW_SDT 第二个参数） |
+| `pid` | number/null | `null` | 可选 PID 过滤 |
+| `interval_secs` | number | `1` | 统计周期（秒） |
+| `thresholds` | object | `{}` | 同 `func_hz`：`min_delta`、`max_gap_ms` |
+
+CLI 用法见 [`docs/mw-sdt.md`](mw-sdt.md)。
+
+## `mw_sdt_trace`
+
+按配置读取 USDT 探测点参数（`arg0..argN`），每次采样经 RingBuf 输出。
+
+```json
+{
+  "type": "mw_sdt_trace",
+  "name": "sub-record-trace",
+  "enabled": true,
+  "binary": "/opt/ros/lib/librclcpp.so",
+  "provider": "rclcpp",
+  "probe": "add_sub_record",
+  "pid": 12345,
+  "sample_rate": 10,
+  "fields": [
+    { "index": 1, "name": "topic", "type": "string" },
+    { "index": 4, "name": "ipc_us", "type": "int64" }
+  ],
+  "outputs": ["console", "web"]
+}
+```
+
+| 字段 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `binary` | string | `""` | 含 MW_SDT 的可执行文件或共享库 |
+| `provider` | string | `""` | USDT provider |
+| `probe` | string | `""` | USDT probe name |
+| `pid` | number/null | `null` | 可选 PID 过滤 |
+| `sample_rate` | number | `1` | 每 N 次命中采 1 次 |
+| `fields` | array | 必填 | 字段列表，至少 1 项，最多 8 项 |
+| `fields[].index` | number | 无 | 参数序号（0 = arg0） |
+| `fields[].name` | string | 无 | 输出字段名 |
+| `fields[].type` | string | 无 | `int64` / `uint64` / `string` / `hex_ptr` |
+| `fields[].max_len` | number | `128` | string 最大读取字节数 |
+
 ## 校验规则
 
 `server --check` 会执行以下校验：
@@ -190,12 +258,14 @@ monitors: []
 - monitor 的每个输出方向必须在 `outputs` 中启用。
 - `sched_latency.pid` 必须大于 0。
 - 函数类 monitor 的 `library` 和 `symbol` 不能为空。
-- 不能同时启用多个相同 `type` 的 monitor。
+- 除 `mw_sdt_hz` / `mw_sdt_trace` 外，不能同时启用多个相同 `type` 的 monitor。
+- `mw_sdt_hz` / `mw_sdt_trace` 各自最多启用 **8** 个实例（按配置顺序分配 `monitor_id` 0..7）。
 
 ## 当前阶段限制
 
-- 每种 `type` 最多只能启用一个 monitor（例如不能同时启用两个 `func_hz`），因为当前 eBPF 侧聚合 map 为单槽设计。
-- 不同类型可以组合启用（例如 `sched_latency` + `func_hz` + `func_latency`），server 会**只加载一份 eBPF 对象**，依次 attach 各 monitor 所需的程序。
+- `func_hz`、`func_latency`、`sched_latency` 每种 `type` 最多只能启用一个 monitor（eBPF 聚合 map 为单槽设计）。
+- `mw_sdt_hz` / `mw_sdt_trace` 支持多实例（最多 8 个），每个实例 attach 到独立 USDT 探测点，统计互不干扰。
+- 不同类型可以组合启用（例如 `sched_latency` + `func_hz` + 多个 `mw_sdt_hz`），server 会**只加载一份 eBPF 对象**，依次 attach 各 monitor 所需的程序。
 
 ## 多 monitor 运行方式
 

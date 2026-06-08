@@ -1,6 +1,7 @@
 use std::{collections::HashSet, fs, path::Path};
 
 use anyhow::{bail, Context as _};
+use rocket_ebpf_common::MW_SDT_MAX_MONITORS;
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -38,6 +39,8 @@ impl ServerConfig {
         let mut names = HashSet::new();
         let mut enabled_kinds: std::collections::HashMap<&'static str, &str> =
             std::collections::HashMap::new();
+        let mut mw_sdt_hz_enabled = 0usize;
+        let mut mw_sdt_trace_enabled = 0usize;
         for monitor in &self.monitors {
             let common = monitor.common();
             if common.name.trim().is_empty() {
@@ -50,14 +53,20 @@ impl ServerConfig {
                 if common.outputs.is_empty() {
                     bail!("monitor {} 启用时 outputs 不能为空", common.name);
                 }
-                let kind = monitor.kind();
-                if let Some(other) = enabled_kinds.get(kind) {
-                    bail!(
-                        "不能同时启用多个 {kind} monitor（当前 eBPF 侧为单槽 map）：{other} 与 {}",
-                        common.name
-                    );
+                match monitor {
+                    MonitorConfig::MwSdtHz(_) => mw_sdt_hz_enabled += 1,
+                    MonitorConfig::MwSdtTrace(_) => mw_sdt_trace_enabled += 1,
+                    _ => {
+                        let kind = monitor.kind();
+                        if let Some(other) = enabled_kinds.get(kind) {
+                            bail!(
+                                "不能同时启用多个 {kind} monitor（当前 eBPF 侧为单槽 map）：{other} 与 {}",
+                                common.name
+                            );
+                        }
+                        enabled_kinds.insert(kind, common.name.as_str());
+                    }
                 }
-                enabled_kinds.insert(kind, common.name.as_str());
             } else {
                 continue;
             }
@@ -78,7 +87,20 @@ impl ServerConfig {
                 }
                 MonitorConfig::FuncLatency(cfg) => validate_func(&cfg.common.name, &cfg.probe)?,
                 MonitorConfig::FuncHz(cfg) => validate_func(&cfg.common.name, &cfg.probe)?,
+                MonitorConfig::MwSdtHz(cfg) => validate_mw_sdt_hz(&cfg.common.name, &cfg.probe)?,
+                MonitorConfig::MwSdtTrace(cfg) => validate_mw_sdt_trace(&cfg)?,
             }
+        }
+
+        if mw_sdt_hz_enabled > MW_SDT_MAX_MONITORS {
+            bail!(
+                "启用的 mw_sdt_hz monitor 不能超过 {MW_SDT_MAX_MONITORS} 个（当前 {mw_sdt_hz_enabled}）"
+            );
+        }
+        if mw_sdt_trace_enabled > MW_SDT_MAX_MONITORS {
+            bail!(
+                "启用的 mw_sdt_trace monitor 不能超过 {MW_SDT_MAX_MONITORS} 个（当前 {mw_sdt_trace_enabled}）"
+            );
         }
 
         Ok(())
@@ -121,6 +143,52 @@ fn validate_func(name: &str, probe: &FuncProbeConfig) -> anyhow::Result<()> {
         bail!("monitor {name} 的 symbol 不能为空");
     }
     Ok(())
+}
+
+fn validate_mw_sdt_hz(name: &str, probe: &MwSdtProbeConfig) -> anyhow::Result<()> {
+    if probe.binary.as_os_str().is_empty() {
+        bail!("monitor {name} 的 binary 不能为空");
+    }
+    if probe.provider.trim().is_empty() {
+        bail!("monitor {name} 的 provider 不能为空");
+    }
+    if probe.probe.trim().is_empty() {
+        bail!("monitor {name} 的 probe 不能为空");
+    }
+    Ok(())
+}
+
+fn validate_mw_sdt_trace(cfg: &MwSdtTraceConfig) -> anyhow::Result<()> {
+    let name = &cfg.common.name;
+    if cfg.probe.binary.as_os_str().is_empty() {
+        bail!("monitor {name} 的 binary 不能为空");
+    }
+    if cfg.probe.provider.trim().is_empty() {
+        bail!("monitor {name} 的 provider 不能为空");
+    }
+    if cfg.probe.probe.trim().is_empty() {
+        bail!("monitor {name} 的 probe 不能为空");
+    }
+    if cfg.fields.is_empty() {
+        bail!("monitor {name} 的 fields 不能为空");
+    }
+    let decls = field_yaml_to_decls(&cfg.fields)?;
+    crate::usdt::build_trace_cfg(&decls, cfg.probe.sample_rate)?;
+    Ok(())
+}
+
+pub fn field_yaml_to_decls(fields: &[MwSdtFieldYaml]) -> anyhow::Result<Vec<crate::usdt::MwSdtFieldDecl>> {
+    fields
+        .iter()
+        .map(|f| {
+            Ok(crate::usdt::MwSdtFieldDecl {
+                index: f.index,
+                name: f.name.clone(),
+                field_type: crate::usdt::MwSdtFieldType::parse(&f.ty)?,
+                max_len: f.max_len.unwrap_or(0),
+            })
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -238,6 +306,8 @@ pub enum MonitorConfig {
     SchedLatency(SchedLatencyConfig),
     FuncLatency(FuncLatencyConfig),
     FuncHz(FuncHzConfig),
+    MwSdtHz(MwSdtHzConfig),
+    MwSdtTrace(MwSdtTraceConfig),
 }
 
 impl MonitorConfig {
@@ -246,6 +316,8 @@ impl MonitorConfig {
             Self::SchedLatency(cfg) => &cfg.common,
             Self::FuncLatency(cfg) => &cfg.common,
             Self::FuncHz(cfg) => &cfg.common,
+            Self::MwSdtHz(cfg) => &cfg.common,
+            Self::MwSdtTrace(cfg) => &cfg.common,
         }
     }
 
@@ -254,6 +326,8 @@ impl MonitorConfig {
             Self::SchedLatency(_) => "sched_latency",
             Self::FuncLatency(_) => "func_latency",
             Self::FuncHz(_) => "func_hz",
+            Self::MwSdtHz(_) => "mw_sdt_hz",
+            Self::MwSdtTrace(_) => "mw_sdt_trace",
         }
     }
 }
@@ -326,6 +400,111 @@ pub struct FuncHzThresholds {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct MwSdtProbeConfig {
+    pub binary: std::path::PathBuf,
+    pub provider: String,
+    pub probe: String,
+    pub pid: Option<u32>,
+    pub interval_secs: u64,
+}
+
+impl Default for MwSdtProbeConfig {
+    fn default() -> Self {
+        Self {
+            binary: std::path::PathBuf::new(),
+            provider: String::new(),
+            probe: String::new(),
+            pid: None,
+            interval_secs: 1,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MwSdtHzConfig {
+    #[serde(flatten)]
+    pub common: MonitorCommon,
+    #[serde(flatten)]
+    pub probe: MwSdtProbeConfig,
+    pub thresholds: FuncHzThresholds,
+}
+
+impl Default for MwSdtHzConfig {
+    fn default() -> Self {
+        Self {
+            common: MonitorCommon::default(),
+            probe: MwSdtProbeConfig::default(),
+            thresholds: FuncHzThresholds::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct MwSdtTraceProbeConfig {
+    pub binary: std::path::PathBuf,
+    pub provider: String,
+    pub probe: String,
+    pub pid: Option<u32>,
+    pub sample_rate: u32,
+}
+
+impl Default for MwSdtTraceProbeConfig {
+    fn default() -> Self {
+        Self {
+            binary: std::path::PathBuf::new(),
+            provider: String::new(),
+            probe: String::new(),
+            pid: None,
+            sample_rate: 1,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MwSdtFieldYaml {
+    pub index: u8,
+    pub name: String,
+    #[serde(rename = "type")]
+    pub ty: String,
+    pub max_len: Option<u16>,
+}
+
+impl Default for MwSdtFieldYaml {
+    fn default() -> Self {
+        Self {
+            index: 0,
+            name: String::new(),
+            ty: String::new(),
+            max_len: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MwSdtTraceConfig {
+    #[serde(flatten)]
+    pub common: MonitorCommon,
+    #[serde(flatten)]
+    pub probe: MwSdtTraceProbeConfig,
+    pub fields: Vec<MwSdtFieldYaml>,
+}
+
+impl Default for MwSdtTraceConfig {
+    fn default() -> Self {
+        Self {
+            common: MonitorCommon::default(),
+            probe: MwSdtTraceProbeConfig::default(),
+            fields: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct FuncLatencyConfig {
     #[serde(flatten)]
@@ -377,7 +556,83 @@ impl Default for SchedLatencyConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::threshold_ms_to_ns;
+    use super::{threshold_ms_to_ns, MonitorConfig, ServerConfig};
+
+    #[test]
+    fn parse_mw_sdt_trace_monitor_yaml() {
+        let raw = r#"
+monitors:
+  - type: mw_sdt_trace
+    name: trace-test
+    enabled: true
+    binary: /tmp/lib.so
+    provider: func
+    probe: enter
+    sample_rate: 2
+    fields:
+      - { index: 0, name: count, type: int64 }
+    outputs: [console]
+"#;
+        let cfg: ServerConfig = serde_yaml::from_str(raw).expect("yaml");
+        cfg.validate().expect("validate");
+        let MonitorConfig::MwSdtTrace(m) = &cfg.monitors[0] else {
+            panic!("expected mw_sdt_trace");
+        };
+        assert_eq!(m.probe.sample_rate, 2);
+        assert_eq!(m.fields[0].name, "count");
+    }
+
+    #[test]
+    fn validate_allows_multiple_mw_sdt_hz() {
+        let raw = r#"
+outputs:
+  console:
+    enabled: true
+monitors:
+  - type: mw_sdt_hz
+    name: a
+    enabled: true
+    binary: /tmp/a.so
+    provider: p
+    probe: x
+    outputs: [console]
+  - type: mw_sdt_hz
+    name: b
+    enabled: true
+    binary: /tmp/b.so
+    provider: p
+    probe: y
+    outputs: [console]
+"#;
+        let cfg: ServerConfig = serde_yaml::from_str(raw).expect("yaml");
+        cfg.validate().expect("two mw_sdt_hz should validate");
+    }
+
+    #[test]
+    fn parse_mw_sdt_hz_monitor_yaml() {
+        let raw = r#"
+monitors:
+  - type: mw_sdt_hz
+    name: test-usdt
+    enabled: true
+    binary: /tmp/libfoo.so
+    provider: rmw
+    probe: rmw_publish
+    pid: 42
+    interval_secs: 2
+    outputs: [console]
+"#;
+        let cfg: ServerConfig = serde_yaml::from_str(raw).expect("yaml");
+        cfg.validate().expect("validate");
+        let MonitorConfig::MwSdtHz(m) = &cfg.monitors[0] else {
+            panic!("expected mw_sdt_hz");
+        };
+        assert_eq!(m.common.name, "test-usdt");
+        assert_eq!(m.probe.provider, "rmw");
+        assert_eq!(m.probe.probe, "rmw_publish");
+        assert_eq!(m.probe.pid, Some(42));
+        assert_eq!(m.probe.interval_secs, 2);
+    }
 
     #[test]
     fn threshold_ms_to_ns_converts_floats() {

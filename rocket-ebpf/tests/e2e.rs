@@ -93,6 +93,7 @@ fn cli_help_smoke() {
         "open",
         "func",
         "sched",
+        "mw_sdt",
         "server",
         "RocketEbpf",
     ] {
@@ -125,6 +126,10 @@ fn cli_subcommand_help_smoke() {
         &["sched", "--help"],
         &["sched", "latency", "--help"],
         &["server", "--help"],
+        &["mw_sdt", "--help"],
+        &["mw_sdt", "list", "--help"],
+        &["mw_sdt", "hz", "--help"],
+        &["mw_sdt", "trace", "--help"],
     ];
 
     for args in cases {
@@ -296,6 +301,133 @@ monitors:
 
 fn repo_config(relative: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(relative)
+}
+
+#[test]
+fn cli_server_check_accepts_mw_sdt_trace_yaml() {
+    let path = temp_config_path("server-mw-sdt-trace", "yaml");
+    fs::write(
+        &path,
+        r#"
+outputs:
+  console:
+    enabled: true
+monitors:
+  - type: mw_sdt_trace
+    name: usdt-trace
+    enabled: true
+    binary: /tmp/mw_sdt_test2
+    provider: func
+    probe: enter
+    sample_rate: 1
+    fields:
+      - { index: 0, name: count, type: int64 }
+    outputs: [console]
+"#,
+    )
+    .expect("write mw_sdt trace yaml");
+
+    let out = Command::new(exe())
+        .args(["server", "--config"])
+        .arg(&path)
+        .arg("--check")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("server --check mw_sdt_trace");
+
+    let _ = fs::remove_file(&path);
+    let combined = combined_output(&out.stdout, &out.stderr);
+    assert!(
+        out.status.success(),
+        "mw_sdt_trace yaml should pass --check: {combined}"
+    );
+}
+
+#[test]
+fn cli_server_check_accepts_multiple_mw_sdt_hz_yaml() {
+    let path = temp_config_path("server-mw-sdt-hz-multi", "yaml");
+    fs::write(
+        &path,
+        r#"
+outputs:
+  console:
+    enabled: true
+monitors:
+  - type: mw_sdt_hz
+    name: recv-ctrl-hz
+    enabled: true
+    binary: /tmp/mw_sdt_test2
+    provider: func
+    probe: enter
+    interval_secs: 1
+    outputs: [console]
+  - type: mw_sdt_hz
+    name: pub-ctrl-hz
+    enabled: true
+    binary: /tmp/mw_sdt_test2
+    provider: func
+    probe: enter
+    interval_secs: 1
+    outputs: [console]
+"#,
+    )
+    .expect("write multi mw_sdt_hz yaml");
+
+    let out = Command::new(exe())
+        .args(["server", "--config"])
+        .arg(&path)
+        .arg("--check")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("server --check multi mw_sdt_hz");
+
+    let _ = fs::remove_file(&path);
+    let combined = combined_output(&out.stdout, &out.stderr);
+    assert!(
+        out.status.success(),
+        "multiple mw_sdt_hz yaml should pass --check: {combined}"
+    );
+}
+
+#[test]
+fn cli_server_check_accepts_mw_sdt_hz_yaml() {
+    let path = temp_config_path("server-mw-sdt-hz", "yaml");
+    fs::write(
+        &path,
+        r#"
+outputs:
+  console:
+    enabled: true
+monitors:
+  - type: mw_sdt_hz
+    name: usdt-hz
+    enabled: true
+    binary: /tmp/mw_sdt_test2
+    provider: func
+    probe: enter
+    interval_secs: 1
+    outputs: [console]
+"#,
+    )
+    .expect("write mw_sdt yaml");
+
+    let out = Command::new(exe())
+        .args(["server", "--config"])
+        .arg(&path)
+        .arg("--check")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("server --check mw_sdt_hz");
+
+    let _ = fs::remove_file(&path);
+    let combined = combined_output(&out.stdout, &out.stderr);
+    assert!(
+        out.status.success(),
+        "mw_sdt_hz yaml should pass --check: {combined}"
+    );
 }
 
 #[test]

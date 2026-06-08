@@ -39,6 +39,98 @@ pub struct SchedLatConfig {
     pub _pad: u32,
 }
 
+/// 同类型 `mw_sdt_*` monitor 最大并发实例数（eBPF map 槽位数）。
+pub const MW_SDT_MAX_MONITORS: usize = 8;
+
+/// `mw_sdt trace`：最多采样的字段数。
+pub const MW_SDT_MAX_FIELDS: usize = 8;
+/// 字符串字段内联缓冲长度（与 eBPF / 用户态一致）。
+pub const MW_SDT_STR_MAX: usize = 128;
+
+pub const MW_SDT_FIELD_INT64: u8 = 0;
+pub const MW_SDT_FIELD_UINT64: u8 = 1;
+pub const MW_SDT_FIELD_STRING: u8 = 2;
+pub const MW_SDT_FIELD_HEX_PTR: u8 = 3;
+
+/// 用户态写入、eBPF 读取的字段规格。
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct MwSdtFieldSpec {
+    pub arg_index: u8,
+    pub field_type: u8,
+    pub _pad: [u8; 2],
+    pub max_len: u16,
+}
+
+/// `mw_sdt trace` 运行时配置（按 monitor_id 索引）。
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct MwSdtTraceCfg {
+    pub sample_rate: u32,
+    pub n_fields: u8,
+    pub _pad: [u8; 3],
+    pub fields: [MwSdtFieldSpec; MW_SDT_MAX_FIELDS],
+}
+
+impl Default for MwSdtTraceCfg {
+    fn default() -> Self {
+        Self {
+            sample_rate: 1,
+            n_fields: 0,
+            _pad: [0; 3],
+            fields: [MwSdtFieldSpec::default(); MW_SDT_MAX_FIELDS],
+        }
+    }
+}
+
+/// 单字段槽：整型/指针用 `i64`，字符串用 `str_buf`。
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct MwSdtFieldSlot {
+    pub kind: u8,
+    pub _pad: [u8; 7],
+    pub i64: i64,
+    pub str_buf: [u8; MW_SDT_STR_MAX],
+}
+
+impl Default for MwSdtFieldSlot {
+    fn default() -> Self {
+        Self {
+            kind: 0,
+            _pad: [0; 7],
+            i64: 0,
+            str_buf: [0; MW_SDT_STR_MAX],
+        }
+    }
+}
+
+/// RingBuf 上报的 USDT 字段采样事件。
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct MwSdtTraceEvent {
+    pub ktime_ns: u64,
+    pub pid: u32,
+    pub cpu: u32,
+    pub monitor_id: u32,
+    pub n_fields: u8,
+    pub _pad: [u8; 3],
+    pub fields: [MwSdtFieldSlot; MW_SDT_MAX_FIELDS],
+}
+
+impl Default for MwSdtTraceEvent {
+    fn default() -> Self {
+        Self {
+            ktime_ns: 0,
+            pid: 0,
+            cpu: 0,
+            monitor_id: 0,
+            n_fields: 0,
+            _pad: [0; 3],
+            fields: [MwSdtFieldSlot::default(); MW_SDT_MAX_FIELDS],
+        }
+    }
+}
+
 /// 单条调度延迟样本（通过 ring buffer 送到用户态）。
 #[repr(C)]
 #[derive(Clone, Copy)]

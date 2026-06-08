@@ -112,7 +112,7 @@ pub async fn run(
 
                 #[cfg(feature = "web")]
                 if let Some(tx) = &web_tx {
-                    let _ = tx.send(crate::web::events::WebEvent::FuncHz {
+                    crate::web::push_event_async(tx, crate::web::events::WebEvent::FuncHz {
                         monitor: attach_symbol.clone(),
                         ts: chrono::Local::now().format("%H:%M:%S").to_string(),
                         library: library.display().to_string(),
