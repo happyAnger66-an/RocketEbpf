@@ -137,7 +137,7 @@ th { color: #8b949e; font-weight: 600; position: sticky; top: 0; background: #16
     </div>
 
     <div id="panel-MwSdtTrace" class="monitor-panel" data-type="MwSdtTrace">
-      <div class="panel-title" id="title-MwSdtTrace">mw_sdt trace</div>
+      <div class="panel-title" id="title-MwSdtTrace">mw_sdt trace (raw)</div>
       <div class="target-info">
         <span><span class="ti-label">Binary:</span><span class="ti-value" id="mst-bin">-</span></span>
         <span><span class="ti-label">USDT:</span><span class="ti-value" id="mst-usdt">-</span></span>
@@ -148,6 +148,24 @@ th { color: #8b949e; font-weight: 600; position: sticky; top: 0; background: #16
           <table>
             <thead><tr><th>Time</th><th>PID</th><th>CPU</th><th>Fields</th></tr></thead>
             <tbody id="mst-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <div id="panel-MwSdtTraceAgg" class="monitor-panel" data-type="MwSdtTraceAgg">
+      <div class="panel-title" id="title-MwSdtTraceAgg">mw_sdt trace agg</div>
+      <div class="target-info">
+        <span><span class="ti-label">Binary:</span><span class="ti-value" id="msta-bin">-</span></span>
+        <span><span class="ti-label">USDT:</span><span class="ti-value" id="msta-usdt">-</span></span>
+        <span><span class="ti-label">Metric unit:</span><span class="ti-value" id="msta-unit">-</span></span>
+      </div>
+      <div class="card">
+        <h2>Aggregated Stats</h2>
+        <div class="event-table-wrap">
+          <table>
+            <thead><tr><th>Time</th><th>Group</th><th>Count</th><th>Mean</th><th>Min</th><th>Max</th><th>P50</th><th>P99</th></tr></thead>
+            <tbody id="msta-tbody"></tbody>
           </table>
         </div>
       </div>
@@ -212,7 +230,8 @@ const TYPE_LABELS = {
   FuncLatency: 'func latency',
   SchedLatency: 'sched latency',
   MwSdtHz: 'mw_sdt hz',
-  MwSdtTrace: 'mw_sdt trace',
+  MwSdtTrace: 'mw_sdt trace (raw)',
+  MwSdtTraceAgg: 'mw_sdt trace agg',
 };
 
 /** @type {Map<string, {type: string, visible: boolean}>} */
@@ -296,6 +315,18 @@ function pushMwSdtTraceData(ev) {
   const tr = document.createElement('tr');
   const fields = ev.fields ? JSON.stringify(ev.fields) : '{}';
   tr.innerHTML = `<td>${escapeHtml(ev.ts || '')}</td><td>${ev.pid ?? ''}</td><td>${ev.cpu ?? ''}</td><td>${escapeHtml(fields)}</td>`;
+  tbody.insertBefore(tr, tbody.firstChild);
+  while (tbody.children.length > MAX_TABLE_ROWS) tbody.removeChild(tbody.lastChild);
+}
+
+function pushMwSdtTraceAggData(ev) {
+  if (ev.binary) document.getElementById('msta-bin').textContent = ev.binary;
+  if (ev.usdt) document.getElementById('msta-usdt').textContent = ev.usdt;
+  if (ev.metric_unit) document.getElementById('msta-unit').textContent = ev.metric_unit;
+  const tbody = document.getElementById('msta-tbody');
+  const tr = document.createElement('tr');
+  const groupLabel = ev.group_by ? `${ev.group_by}=${ev.group_key}` : String(ev.group_key ?? '');
+  tr.innerHTML = `<td>${escapeHtml(ev.ts || '')}</td><td>${escapeHtml(groupLabel)}</td><td>${ev.count ?? ''}</td><td>${fmtMetric(ev.mean, 3)}</td><td>${fmtMetric(ev.min, 3)}</td><td>${fmtMetric(ev.max, 3)}</td><td>${fmtMetric(ev.p50, 3)}</td><td>${fmtMetric(ev.p99, 3)}</td>`;
   tbody.insertBefore(tr, tbody.firstChild);
   while (tbody.children.length > MAX_TABLE_ROWS) tbody.removeChild(tbody.lastChild);
 }
@@ -437,7 +468,7 @@ function clearAllDisplay() {
   setText('lat-imin', 'n/a');
   setText('lat-imax', 'n/a');
 
-  ['mst-tbody', 'sched-tbody'].forEach(id => {
+  ['mst-tbody', 'msta-tbody', 'sched-tbody'].forEach(id => {
     const tbody = document.getElementById(id);
     if (tbody) tbody.innerHTML = '';
   });
@@ -577,6 +608,8 @@ function handleEvent(ev) {
     pushMwSdtHzData(ev);
   } else if (type === 'MwSdtTrace') {
     pushMwSdtTraceData(ev);
+  } else if (type === 'MwSdtTraceAgg') {
+    pushMwSdtTraceAggData(ev);
   } else if (type === 'FuncLatency') {
     pushLatData(ev);
   } else if (type === 'SchedLatency') {

@@ -52,13 +52,40 @@ pub const MW_SDT_FIELD_UINT64: u8 = 1;
 pub const MW_SDT_FIELD_STRING: u8 = 2;
 pub const MW_SDT_FIELD_HEX_PTR: u8 = 3;
 
-/// 用户态写入、eBPF 读取的字段规格。
+/// x86_64 `pt_regs` 寄存器编号（与 USDT arg_template 解析结果一致）。
+pub const MW_SDT_REG_R15: u8 = 0;
+pub const MW_SDT_REG_R14: u8 = 1;
+pub const MW_SDT_REG_R13: u8 = 2;
+pub const MW_SDT_REG_R12: u8 = 3;
+pub const MW_SDT_REG_RBP: u8 = 4;
+pub const MW_SDT_REG_RBX: u8 = 5;
+pub const MW_SDT_REG_R11: u8 = 6;
+pub const MW_SDT_REG_R10: u8 = 7;
+pub const MW_SDT_REG_R9: u8 = 8;
+pub const MW_SDT_REG_R8: u8 = 9;
+pub const MW_SDT_REG_RAX: u8 = 10;
+pub const MW_SDT_REG_RCX: u8 = 11;
+pub const MW_SDT_REG_RDX: u8 = 12;
+pub const MW_SDT_REG_RSI: u8 = 13;
+pub const MW_SDT_REG_RDI: u8 = 14;
+
+pub const MW_SDT_LOC_REG: u8 = 0;
+pub const MW_SDT_LOC_MEM: u8 = 1;
+
+/// 用户态写入、eBPF 读取的字段规格（位置由 USDT note 解析后填入）。
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct MwSdtFieldSpec {
-    pub arg_index: u8,
     pub field_type: u8,
-    pub _pad: [u8; 2],
+    pub loc_kind: u8,
+    pub reg: u8,
+    /// 读取宽度：4 或 8（字节）。
+    pub width: u8,
+    /// 1 表示 32 位有符号扩展到 i64。
+    pub sign_ext: u8,
+    pub _pad: [u8; 3],
+    /// `loc_kind == MW_SDT_LOC_MEM` 时：用户态地址 = reg + mem_offset。
+    pub mem_offset: i32,
     pub max_len: u16,
 }
 

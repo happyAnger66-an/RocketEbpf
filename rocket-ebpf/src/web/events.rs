@@ -55,6 +55,22 @@ pub enum WebEvent {
         cpu: u32,
         fields: std::collections::HashMap<String, String>,
     },
+    MwSdtTraceAgg {
+        monitor: String,
+        ts: String,
+        binary: String,
+        usdt: String,
+        group_by: String,
+        group_key: i64,
+        metric: String,
+        metric_unit: String,
+        count: u64,
+        mean: Option<f64>,
+        min: Option<f64>,
+        max: Option<f64>,
+        p50: Option<f64>,
+        p99: Option<f64>,
+    },
 }
 
 #[cfg(test)]

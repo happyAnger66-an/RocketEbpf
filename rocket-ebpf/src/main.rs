@@ -5,6 +5,7 @@ mod cxx_symbol;
 mod ebpf;
 mod server;
 mod stats;
+mod trace_agg;
 mod usdt;
 #[cfg(feature = "web")]
 mod web;

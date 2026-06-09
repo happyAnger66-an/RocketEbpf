@@ -18,6 +18,19 @@ outputs:
     enabled: true
 
 monitors:
+  - type: func_hz
+    name: gw-rb_state-hz
+    enabled: false
+    library: /home/wujie/codes/grid-merge/anyverse/.ws/build/trro_gateway/libtrro_gateway_core.so
+    symbol: trro_gateway::TrroGatewayNode::onTrroRobotState
+    cxx: true
+#    pid: 75275  # 改成你的测试程序 PID（线程组 leader）
+    interval_secs: 1
+    # thresholds 仅影响 console/log 告警；Web UI 每个周期都会收到指标
+    # 不设 thresholds 时 console 也会每周期打印
+    thresholds: {}
+    outputs: [web]
+
   - type: mw_sdt_hz
     name: trro_gw-recv_ctrl-hz
     enabled: false
@@ -43,6 +56,19 @@ monitors:
     interval_secs: 1
     thresholds: {}
     outputs: [console, web]
+  
+  - type: mw_sdt_hz
+    name: trro_gw-pub_video_capture_latency-hz
+    enabled: false
+    # 含 MW_SDT 的二进制或 .so（推荐绝对路径）
+    binary: /home/wujie/codes/grid-merge/anyverse/.ws/build/trro_gateway/libtrro_gateway_core.so
+    provider: trro_gw
+    probe: video_capture_latency
+    # pid 可选：省略或写 null → 不限制进程，监控所有命中该 USDT 的进程
+    # pid: 12345
+    interval_secs: 1
+    thresholds: {}
+    outputs: [console, web]
 
   # 字段采样：读取 MW_SDT 参数值
   - type: mw_sdt_trace
@@ -56,4 +82,13 @@ monitors:
     fields:
       - { index: 0, name: stream_id, type: int64 }
       - { index: 3, name: latency, type: int64 }
+    # 默认只输出聚合；设 emit_raw: true 可同时逐条输出原始事件
+    aggregate:
+      interval_secs: 1
+      by: stream_id
+      metric: latency
+      stats: [count, mean, min, max, p50, p99]
+      max_groups: 64
+      sample_cap: 8192
+      metric_unit: ms
     outputs: [console, web]

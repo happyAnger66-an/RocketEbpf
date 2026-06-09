@@ -316,12 +316,13 @@ monitors:
   - type: mw_sdt_trace
     name: usdt-trace
     enabled: true
-    binary: /tmp/mw_sdt_test2
+    binary: /nonexistent/rocket-ebpf-test/mw_sdt_test2
     provider: func
     probe: enter
     sample_rate: 1
     fields:
       - { index: 0, name: count, type: int64 }
+    emit_raw: true
     outputs: [console]
 "#,
     )

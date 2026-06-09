@@ -24,13 +24,15 @@ use tokio::signal;
 use crate::{
     cli::ServerArgs,
     stats::IntervalPercentileTracker,
+    trace_agg::{MetricUnit, MwSdtTraceAggregator, StatsSpec},
     config::{
         field_yaml_to_decls, FuncHzConfig, FuncLatencyConfig, FuncProbeConfig, MonitorConfig,
         MwSdtHzConfig, MwSdtTraceConfig, SchedLatencyConfig, ServerConfig,
     },
     usdt::{
-        attach_mw_sdt_hz, attach_mw_sdt_trace, build_trace_cfg, decode_trace_event,
-        validate_fields_against_probe, MwSdtFieldType,
+        attach::resolve_binary_for_attach,
+        attach_mw_sdt_hz, attach_mw_sdt_trace, build_trace_cfg, decode_trace_event, find_probe,
+        trace_field_i64, validate_fields_against_probe, MwSdtFieldType,
     },
 };
 
@@ -121,6 +123,22 @@ enum AlertEvent {
         pid: u32,
         cpu: u32,
         fields: std::collections::HashMap<String, String>,
+    },
+    MwSdtTraceAgg {
+        ts: String,
+        monitor: String,
+        binary: String,
+        usdt: String,
+        group_by: String,
+        group_key: i64,
+        metric: String,
+        metric_unit: String,
+        count: u64,
+        mean: Option<f64>,
+        min: Option<f64>,
+        max: Option<f64>,
+        p50: Option<f64>,
+        p99: Option<f64>,
     },
 }
 
@@ -333,8 +351,18 @@ fn spawn_mw_sdt_trace(
     }
 
     let field_decls = field_yaml_to_decls(&cfg.fields)?;
-    let trace_cfg = build_trace_cfg(&field_decls, cfg.probe.sample_rate)?;
-    let (resolved, probe) = attach_mw_sdt_trace(
+    let path = resolve_binary_for_attach(&cfg.probe.binary, cfg.probe.pid).context("解析二进制路径")?;
+    let probe = find_probe(&path, &cfg.probe.provider, &cfg.probe.probe).with_context(|| {
+        format!(
+            "在 {} 中查找 USDT {}:{}",
+            path.display(),
+            cfg.probe.provider,
+            cfg.probe.probe
+        )
+    })?;
+    validate_fields_against_probe(&field_decls, &probe)?;
+    let trace_cfg = build_trace_cfg(&field_decls, cfg.probe.sample_rate, &probe)?;
+    let (resolved, _probe) = attach_mw_sdt_trace(
         ebpf,
         &cfg.probe.binary,
         &cfg.probe.provider,
@@ -343,7 +371,6 @@ fn spawn_mw_sdt_trace(
         monitor_id,
         &trace_cfg,
     )?;
-    validate_fields_against_probe(&field_decls, &probe)?;
     let usdt_label = format!("{}:{}", cfg.probe.provider, cfg.probe.probe);
     let field_names: Vec<String> = field_decls.iter().map(|f| f.name.clone()).collect();
     let field_types: Vec<MwSdtFieldType> = field_decls.iter().map(|f| f.field_type).collect();
@@ -713,6 +740,30 @@ fn format_alert(alert: &AlertEvent) -> String {
                 "monitor={monitor} type=mw_sdt_trace usdt={usdt} pid={pid} cpu={cpu} fields={fields_json}"
             )
         }
+        AlertEvent::MwSdtTraceAgg {
+            monitor,
+            usdt,
+            group_by,
+            group_key,
+            metric,
+            metric_unit,
+            count,
+            mean,
+            min,
+            max,
+            p50,
+            p99,
+            ..
+        } => {
+            format!(
+                "monitor={monitor} type=mw_sdt_trace_agg usdt={usdt} {group_by}={group_key} {metric} unit={metric_unit} count={count} mean={} min={} max={} p50={} p99={}",
+                opt_f64(*mean, 3),
+                opt_f64(*min, 3),
+                opt_f64(*max, 3),
+                opt_f64(*p50, 3),
+                opt_f64(*p99, 3),
+            )
+        }
         AlertEvent::SchedLatency {
             monitor,
             wall_local,
@@ -734,6 +785,11 @@ fn format_alert(alert: &AlertEvent) -> String {
 
 fn opt_u64(v: Option<u64>) -> String {
     v.map(|n| n.to_string())
+        .unwrap_or_else(|| "n/a".to_string())
+}
+
+fn opt_f64(v: Option<f64>, prec: usize) -> String {
+    v.map(|n| format!("{n:.prec$}"))
         .unwrap_or_else(|| "n/a".to_string())
 }
 
@@ -824,6 +880,38 @@ fn to_web_event(alert: &AlertEvent) -> crate::web::events::WebEvent {
             cpu: *cpu,
             fields: fields.clone(),
         },
+        AlertEvent::MwSdtTraceAgg {
+            monitor,
+            ts,
+            binary,
+            usdt,
+            group_by,
+            group_key,
+            metric,
+            metric_unit,
+            count,
+            mean,
+            min,
+            max,
+            p50,
+            p99,
+            ..
+        } => crate::web::events::WebEvent::MwSdtTraceAgg {
+            monitor: monitor.clone(),
+            ts: ts.clone(),
+            binary: binary.clone(),
+            usdt: usdt.clone(),
+            group_by: group_by.clone(),
+            group_key: *group_key,
+            metric: metric.clone(),
+            metric_unit: metric_unit.clone(),
+            count: *count,
+            mean: *mean,
+            min: *min,
+            max: *max,
+            p50: *p50,
+            p99: *p99,
+        },
         AlertEvent::SchedLatency {
             monitor,
             wall_local,
@@ -855,38 +943,173 @@ async fn run_mw_sdt_trace_loop(
     cfg: &MwSdtTraceConfig,
     runtime: &ServerRuntime,
 ) -> anyhow::Result<()> {
+    let emit_raw = cfg.emit_raw;
+    let agg_cfg = cfg.aggregate.as_ref();
+    let by_idx = agg_cfg.and_then(|a| field_names.iter().position(|n| n == &a.by));
+    let metric_idx = agg_cfg.and_then(|a| field_names.iter().position(|n| n == &a.metric));
+    let mut aggregator = agg_cfg.map(|a| {
+        MwSdtTraceAggregator::new(
+            a.max_groups,
+            a.sample_cap,
+            StatsSpec::parse(&a.stats).expect("aggregate.stats validated"),
+            MetricUnit::parse(&a.metric_unit).expect("aggregate.metric_unit validated"),
+        )
+    });
+    let mut agg_tick = agg_cfg.map(|a| {
+        let mut t = tokio::time::interval(Duration::from_secs(a.interval_secs.max(1)));
+        t.tick();
+        t
+    });
+    let group_by_name = agg_cfg.map(|a| a.by.as_str()).unwrap_or("");
+    let metric_name = agg_cfg.map(|a| a.metric.as_str()).unwrap_or("");
+    let metric_unit = agg_cfg
+        .map(|a| a.metric_unit.as_str())
+        .unwrap_or("ns");
+
     let mut poll = tokio::time::interval(Duration::from_millis(50));
     poll.tick().await;
     loop {
-        tokio::select! {
-            _ = poll.tick() => {
-                let mut rb = ring.lock().expect("MW_SDT_TRACE_EVENTS mutex");
-                while let Some(item) = rb.next() {
-                    if item.len() != mem::size_of::<MwSdtTraceEvent>() {
-                        continue;
-                    }
-                    let ev = unsafe { (item.as_ptr() as *const MwSdtTraceEvent).read_unaligned() };
-                    if ev.monitor_id != monitor_id {
-                        continue;
-                    }
-                    let fields = decode_trace_event(&ev, field_names, field_types);
-                    emit_event(
+        if agg_tick.is_some() {
+            let tick = agg_tick.as_mut().unwrap();
+            tokio::select! {
+                _ = poll.tick() => {
+                    drain_mw_sdt_trace_ring(
+                        &ring,
+                        monitor_id,
+                        field_names,
+                        field_types,
+                        cfg,
                         runtime,
-                        &cfg.common.outputs,
-                        AlertEvent::MwSdtTrace {
-                            ts: Local::now().format("%H:%M:%S%.3f").to_string(),
-                            monitor: cfg.common.name.clone(),
-                            binary: resolved_binary.to_string(),
-                            usdt: usdt_label.to_string(),
-                            pid: ev.pid,
-                            cpu: ev.cpu,
-                            fields,
-                        },
-                        true,
+                        usdt_label,
+                        resolved_binary,
+                        emit_raw,
+                        aggregator.as_mut(),
+                        by_idx,
+                        metric_idx,
+                    );
+                }
+                _ = tick.tick() => {
+                    flush_mw_sdt_trace_agg(
+                        aggregator.as_mut(),
+                        cfg,
+                        runtime,
+                        usdt_label,
+                        resolved_binary,
+                        group_by_name,
+                        metric_name,
+                        metric_unit,
                     );
                 }
             }
+        } else {
+            poll.tick().await;
+            drain_mw_sdt_trace_ring(
+                &ring,
+                monitor_id,
+                field_names,
+                field_types,
+                cfg,
+                runtime,
+                usdt_label,
+                resolved_binary,
+                emit_raw,
+                None,
+                None,
+                None,
+            );
         }
+    }
+}
+
+fn drain_mw_sdt_trace_ring(
+    ring: &Arc<Mutex<RingBuf<MapData>>>,
+    monitor_id: u32,
+    field_names: &[String],
+    field_types: &[MwSdtFieldType],
+    cfg: &MwSdtTraceConfig,
+    runtime: &ServerRuntime,
+    usdt_label: &str,
+    resolved_binary: &str,
+    emit_raw: bool,
+    mut aggregator: Option<&mut MwSdtTraceAggregator>,
+    by_idx: Option<usize>,
+    metric_idx: Option<usize>,
+) {
+    let mut rb = ring.lock().expect("MW_SDT_TRACE_EVENTS mutex");
+    while let Some(item) = rb.next() {
+        if item.len() != mem::size_of::<MwSdtTraceEvent>() {
+            continue;
+        }
+        let ev = unsafe { (item.as_ptr() as *const MwSdtTraceEvent).read_unaligned() };
+        if ev.monitor_id != monitor_id {
+            continue;
+        }
+        if let (Some(by_i), Some(metric_i)) = (by_idx, metric_idx) {
+            if let Some(agg) = aggregator.as_mut() {
+                if let (Some(gk), Some(mv)) = (
+                    trace_field_i64(&ev, by_i),
+                    trace_field_i64(&ev, metric_i),
+                ) {
+                    agg.record(gk, mv);
+                }
+            }
+        }
+        if emit_raw {
+            let fields = decode_trace_event(&ev, field_names, field_types);
+            emit_event(
+                runtime,
+                &cfg.common.outputs,
+                AlertEvent::MwSdtTrace {
+                    ts: Local::now().format("%H:%M:%S%.3f").to_string(),
+                    monitor: cfg.common.name.clone(),
+                    binary: resolved_binary.to_string(),
+                    usdt: usdt_label.to_string(),
+                    pid: ev.pid,
+                    cpu: ev.cpu,
+                    fields,
+                },
+                true,
+            );
+        }
+    }
+}
+
+fn flush_mw_sdt_trace_agg(
+    aggregator: Option<&mut MwSdtTraceAggregator>,
+    cfg: &MwSdtTraceConfig,
+    runtime: &ServerRuntime,
+    usdt_label: &str,
+    resolved_binary: &str,
+    group_by_name: &str,
+    metric_name: &str,
+    metric_unit: &str,
+) {
+    let Some(agg) = aggregator else {
+        return;
+    };
+    let ts = Local::now().format("%H:%M:%S").to_string();
+    for row in agg.flush() {
+        emit_event(
+            runtime,
+            &cfg.common.outputs,
+            AlertEvent::MwSdtTraceAgg {
+                ts: ts.clone(),
+                monitor: cfg.common.name.clone(),
+                binary: resolved_binary.to_string(),
+                usdt: usdt_label.to_string(),
+                group_by: group_by_name.to_string(),
+                group_key: row.group_key,
+                metric: metric_name.to_string(),
+                metric_unit: metric_unit.to_string(),
+                count: row.count,
+                mean: row.mean,
+                min: row.min,
+                max: row.max,
+                p50: row.p50,
+                p99: row.p99,
+            },
+            true,
+        );
     }
 }
 

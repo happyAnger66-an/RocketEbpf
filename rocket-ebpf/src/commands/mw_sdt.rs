@@ -10,10 +10,11 @@ use tokio::signal;
 use crate::cli::{MwSdtHzArgs, MwSdtTraceArgs};
 use crate::stats::IntervalPercentileTracker;
 use crate::usdt::{
-    attach_mw_sdt_hz, attach_mw_sdt_trace, build_trace_cfg, decode_trace_event, list_probes,
-    parse_field_spec, parse_usdt_spec, validate_fields_against_probe, MwSdtFieldDecl,
+    attach_mw_sdt_hz, attach_mw_sdt_trace, build_trace_cfg, decode_trace_event, find_probe,
+    list_probes, parse_field_spec, parse_usdt_spec, validate_fields_against_probe, MwSdtFieldDecl,
     MwSdtFieldType,
 };
+use crate::usdt::attach::resolve_binary_for_attach;
 
 #[repr(transparent)]
 #[derive(Clone, Copy)]
@@ -172,11 +173,19 @@ pub async fn run_trace(
         .iter()
         .map(|s| parse_field_spec(s))
         .collect::<anyhow::Result<_>>()?;
-    let trace_cfg = build_trace_cfg(&field_decls, sample_rate)?;
     let (provider, probe_name) = parse_usdt_spec(&usdt)?;
     let usdt_label = format!("{provider}:{probe_name}");
+    let path = resolve_binary_for_attach(&binary, pid).context("解析二进制路径")?;
+    let probe = find_probe(&path, &provider, &probe_name).with_context(|| {
+        format!(
+            "在 {} 中查找 USDT {usdt_label}",
+            path.display()
+        )
+    })?;
+    validate_fields_against_probe(&field_decls, &probe)?;
+    let trace_cfg = build_trace_cfg(&field_decls, sample_rate, &probe)?;
 
-    let (resolved, probe) = attach_mw_sdt_trace(
+    let (resolved, _probe) = attach_mw_sdt_trace(
         ebpf,
         &binary,
         &provider,
@@ -185,7 +194,6 @@ pub async fn run_trace(
         0,
         &trace_cfg,
     )?;
-    validate_fields_against_probe(&field_decls, &probe)?;
 
     let mut ring = RingBuf::try_from(
         ebpf.take_map("MW_SDT_TRACE_EVENTS")

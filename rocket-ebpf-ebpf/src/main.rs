@@ -4,8 +4,8 @@
 use aya_ebpf::{
     helpers::{
         bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_smp_processor_id, bpf_ktime_get_ns,
-        bpf_probe_read_kernel, bpf_probe_read_kernel_buf, bpf_probe_read_kernel_str_bytes,
-        bpf_probe_read_user_str_bytes,
+        bpf_probe_read, bpf_probe_read_kernel, bpf_probe_read_kernel_buf,
+        bpf_probe_read_kernel_str_bytes, gen,
     },
     macros::{map, tracepoint, uprobe, uretprobe},
     maps::{Array, HashMap, PerCpuArray, RingBuf},
@@ -14,9 +14,12 @@ use aya_ebpf::{
 };
 use aya_log_ebpf::info;
 use rocket_ebpf_common::{
-    FuncHzGlobalGap, FuncHzPerCpu, FuncLatencyAgg, MwSdtFieldSlot, MwSdtFieldSpec, MwSdtTraceCfg,
+    FuncHzGlobalGap, FuncHzPerCpu, FuncLatencyAgg, MwSdtFieldSlot, MwSdtTraceCfg,
     MwSdtTraceEvent, SchedLatConfig, SchedLatEvent, MW_SDT_FIELD_HEX_PTR, MW_SDT_FIELD_INT64,
-    MW_SDT_FIELD_STRING, MW_SDT_FIELD_UINT64, MW_SDT_MAX_MONITORS, MW_SDT_STR_MAX,
+    MW_SDT_FIELD_STRING, MW_SDT_FIELD_UINT64, MW_SDT_LOC_MEM, MW_SDT_LOC_REG, MW_SDT_MAX_MONITORS,
+    MW_SDT_REG_R10, MW_SDT_REG_R11, MW_SDT_REG_R12, MW_SDT_REG_R13, MW_SDT_REG_R14, MW_SDT_REG_R15,
+    MW_SDT_REG_R8, MW_SDT_REG_R9, MW_SDT_REG_RAX, MW_SDT_REG_RBP, MW_SDT_REG_RBX, MW_SDT_REG_RDI,
+    MW_SDT_REG_RCX, MW_SDT_REG_RDX, MW_SDT_REG_RSI, MW_SDT_STR_MAX,
 };
 
 /// `sched:sched_process_exec` 的 trace 记录布局（`struct trace_entry` 8 字节后）：
@@ -273,114 +276,147 @@ fn try_sched_lat_switch(ctx: TracePointContext) -> Result<u32, u32> {
     Ok(0)
 }
 
-fn read_mw_sdt_field(ctx: &ProbeContext, spec: &MwSdtFieldSpec, slot: &mut MwSdtFieldSlot) {
-    *slot = MwSdtFieldSlot::default();
-    let idx = spec.arg_index as usize;
-    match spec.field_type {
-        MW_SDT_FIELD_INT64 => {
-            if let Some(v) = ctx.arg::<i64>(idx) {
-                slot.kind = MW_SDT_FIELD_INT64;
-                slot.i64 = v;
+/// 从 pt_regs 读取 USDT arg_template 指定的寄存器（须 bpf_probe_read，不能 ctx+offset）。
+macro_rules! mw_sdt_read_reg_raw {
+    ($ctx:expr, $reg:expr) => {{
+        unsafe {
+            let regs = &*($ctx).regs;
+            #[cfg(bpf_target_arch = "x86_64")]
+            {
+                match $reg {
+                    MW_SDT_REG_R15 => bpf_probe_read(&regs.r15).ok(),
+                    MW_SDT_REG_R14 => bpf_probe_read(&regs.r14).ok(),
+                    MW_SDT_REG_R13 => bpf_probe_read(&regs.r13).ok(),
+                    MW_SDT_REG_R12 => bpf_probe_read(&regs.r12).ok(),
+                    MW_SDT_REG_RBP => bpf_probe_read(&regs.rbp).ok(),
+                    MW_SDT_REG_RBX => bpf_probe_read(&regs.rbx).ok(),
+                    MW_SDT_REG_R11 => bpf_probe_read(&regs.r11).ok(),
+                    MW_SDT_REG_R10 => bpf_probe_read(&regs.r10).ok(),
+                    MW_SDT_REG_R9 => bpf_probe_read(&regs.r9).ok(),
+                    MW_SDT_REG_R8 => bpf_probe_read(&regs.r8).ok(),
+                    MW_SDT_REG_RAX => bpf_probe_read(&regs.rax).ok(),
+                    MW_SDT_REG_RCX => bpf_probe_read(&regs.rcx).ok(),
+                    MW_SDT_REG_RDX => bpf_probe_read(&regs.rdx).ok(),
+                    MW_SDT_REG_RSI => bpf_probe_read(&regs.rsi).ok(),
+                    MW_SDT_REG_RDI => bpf_probe_read(&regs.rdi).ok(),
+                    _ => None,
+                }
+            }
+            #[cfg(bpf_target_arch = "aarch64")]
+            {
+                if $reg <= 7 {
+                    bpf_probe_read(&regs.regs[$reg as usize]).ok()
+                } else {
+                    None
+                }
+            }
+            #[cfg(not(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64")))]
+            {
+                let _ = regs;
+                None
             }
         }
-        MW_SDT_FIELD_UINT64 => {
-            if let Some(v) = ctx.arg::<u64>(idx) {
-                slot.kind = MW_SDT_FIELD_UINT64;
-                slot.i64 = v as i64;
-            }
-        }
-        MW_SDT_FIELD_HEX_PTR => {
-            if let Some(v) = ctx.arg::<u64>(idx) {
-                slot.kind = MW_SDT_FIELD_HEX_PTR;
-                slot.i64 = v as i64;
-            }
-        }
-        MW_SDT_FIELD_STRING => {
-            let Some(ptr) = ctx.arg::<*const u8>(idx) else {
-                return;
-            };
-            if ptr.is_null() {
-                return;
-            }
-            slot.kind = MW_SDT_FIELD_STRING;
-            let mut cap = spec.max_len as usize;
-            if cap == 0 || cap > MW_SDT_STR_MAX {
-                cap = MW_SDT_STR_MAX;
-            }
-            let buf = &mut slot.str_buf[..cap];
-            if unsafe { bpf_probe_read_user_str_bytes(ptr, buf) }.is_ok() {
-                // str_buf 已由 helper 写入
-            }
-        }
-        _ => {}
-    }
+    }};
 }
 
-fn try_mw_sdt_trace_hit(ctx: ProbeContext, monitor_id: u32) -> Result<u32, u32> {
-    let cfg_ptr = match MW_SDT_TRACE_CFG.get(monitor_id) {
-        Some(p) => p,
-        None => return Ok(0),
-    };
-    let cfg = unsafe { *cfg_ptr };
-    if cfg.n_fields == 0 {
-        return Ok(0);
-    }
+macro_rules! mw_sdt_read_field_raw {
+    ($ctx:expr, $field:expr) => {{
+        let field = $field;
+        let raw = if field.loc_kind == MW_SDT_LOC_REG {
+            mw_sdt_read_reg_raw!($ctx, field.reg)
+        } else if field.loc_kind == MW_SDT_LOC_MEM {
+            mw_sdt_read_mem_raw!($ctx, field.reg, field.mem_offset, field.width)
+        } else {
+            None
+        };
+        raw
+    }};
+}
 
-    let rate = cfg.sample_rate.max(1) as u64;
-    if let Some(c) = MW_SDT_TRACE_SAMPLE.get_ptr_mut(monitor_id) {
-        unsafe {
-            *c = (*c).wrapping_add(1);
-            if (*c) % rate != 0 {
-                return Ok(0);
+macro_rules! mw_sdt_read_mem_raw {
+    ($ctx:expr, $base_reg:expr, $offset:expr, $width:expr) => {{
+        mw_sdt_read_reg_raw!($ctx, $base_reg).and_then(|base| {
+            let addr = (base as i64).wrapping_add($offset as i64) as *const u8;
+            if $width == 4 {
+                let mut v: u32 = 0;
+                let ok = unsafe {
+                    gen::bpf_probe_read_user(
+                        &mut v as *mut u32 as *mut _,
+                        4,
+                        addr as *const _,
+                    )
+                };
+                if ok == 0 {
+                    Some(v as u64)
+                } else {
+                    None
+                }
+            } else {
+                let mut v: u64 = 0;
+                let ok = unsafe {
+                    gen::bpf_probe_read_user(
+                        &mut v as *mut u64 as *mut _,
+                        8,
+                        addr as *const _,
+                    )
+                };
+                if ok == 0 {
+                    Some(v)
+                } else {
+                    None
+                }
+            }
+        })
+    }};
+}
+
+macro_rules! read_mw_sdt_field {
+    ($ctx:expr, $cfg_ptr:expr, $field_idx:literal, $slot:expr) => {{
+        let slot = $slot;
+        slot.kind = 0;
+        slot.i64 = 0;
+        let field = unsafe { &(*$cfg_ptr).fields[$field_idx] };
+        if let Some(raw) = mw_sdt_read_field_raw!($ctx, field) {
+            let value = if field.width == 4 {
+                if field.sign_ext != 0 {
+                    (raw as u32 as i32) as i64
+                } else {
+                    (raw as u32) as i64
+                }
+            } else {
+                raw as i64
+            };
+            match field.field_type {
+                MW_SDT_FIELD_INT64 => {
+                    slot.kind = MW_SDT_FIELD_INT64;
+                    slot.i64 = value;
+                }
+                MW_SDT_FIELD_UINT64 => {
+                    slot.kind = MW_SDT_FIELD_UINT64;
+                    slot.i64 = value;
+                }
+                MW_SDT_FIELD_HEX_PTR => {
+                    slot.kind = MW_SDT_FIELD_HEX_PTR;
+                    slot.i64 = value;
+                }
+                MW_SDT_FIELD_STRING => {
+                    if value != 0 {
+                        slot.kind = MW_SDT_FIELD_STRING;
+                        slot.str_buf[0] = 0;
+                        let ptr = value as *const u8;
+                        let _ = unsafe {
+                            gen::bpf_probe_read_user_str(
+                                slot.str_buf.as_mut_ptr() as *mut _,
+                                MW_SDT_STR_MAX as u32,
+                                ptr as *const _,
+                            )
+                        };
+                    }
+                }
+                _ => {}
             }
         }
-    }
-
-    let ev_ptr = match MW_SDT_TRACE_SCRATCH.get_ptr_mut(monitor_id) {
-        Some(p) => p,
-        None => return Ok(0),
-    };
-    unsafe {
-        let ev = &mut *ev_ptr;
-        ev.ktime_ns = bpf_ktime_get_ns();
-        ev.pid = (bpf_get_current_pid_tgid() >> 32) as u32;
-        ev.cpu = bpf_get_smp_processor_id();
-        ev.monitor_id = monitor_id;
-        ev.n_fields = cfg.n_fields;
-        ev._pad = [0; 3];
-
-        if cfg.n_fields > 0 {
-            read_mw_sdt_field(&ctx, &cfg.fields[0], &mut ev.fields[0]);
-        }
-        if cfg.n_fields > 1 {
-            read_mw_sdt_field(&ctx, &cfg.fields[1], &mut ev.fields[1]);
-        }
-        if cfg.n_fields > 2 {
-            read_mw_sdt_field(&ctx, &cfg.fields[2], &mut ev.fields[2]);
-        }
-        if cfg.n_fields > 3 {
-            read_mw_sdt_field(&ctx, &cfg.fields[3], &mut ev.fields[3]);
-        }
-        if cfg.n_fields > 4 {
-            read_mw_sdt_field(&ctx, &cfg.fields[4], &mut ev.fields[4]);
-        }
-        if cfg.n_fields > 5 {
-            read_mw_sdt_field(&ctx, &cfg.fields[5], &mut ev.fields[5]);
-        }
-        if cfg.n_fields > 6 {
-            read_mw_sdt_field(&ctx, &cfg.fields[6], &mut ev.fields[6]);
-        }
-        if cfg.n_fields > 7 {
-            read_mw_sdt_field(&ctx, &cfg.fields[7], &mut ev.fields[7]);
-        }
-
-        if MW_SDT_TRACE_EVENTS.output(ev, 0).is_err() {
-            if let Some(d) = MW_SDT_TRACE_DROPS.get_ptr_mut(monitor_id) {
-                *d = (*d).wrapping_add(1);
-            }
-        }
-    }
-    Ok(0)
+    }};
 }
 
 fn mw_sdt_hz_hit_impl(monitor_id: u32) {
@@ -415,13 +451,85 @@ macro_rules! mw_sdt_hz_hit_slot {
 }
 
 macro_rules! mw_sdt_trace_hit_slot {
+    // 不用 #[uprobe]：该宏会生成 c_void 包装层 + 内嵌 Rust 函数；大函数无法内联时
+    // aya relocate 后程序末尾是 call 而非 exit，verifier 报 processed 0 insns。
     ($id:expr, $name:ident) => {
-        #[uprobe]
-        pub fn $name(ctx: ProbeContext) -> u32 {
-            match try_mw_sdt_trace_hit(ctx, $id) {
-                Ok(v) => v,
-                Err(v) => v,
+        #[unsafe(no_mangle)]
+        #[unsafe(link_section = "uprobe")]
+        pub fn $name(ctx: *mut core::ffi::c_void) -> u32 {
+            let ctx = ProbeContext::new(ctx);
+            const MONITOR_ID: u32 = $id;
+            let cfg_ptr = match MW_SDT_TRACE_CFG.get(MONITOR_ID) {
+                Some(p) => p,
+                None => return 0,
+            };
+            let n_fields = unsafe { (*cfg_ptr).n_fields };
+            if n_fields == 0 {
+                return 0;
             }
+
+            let sample_rate = unsafe { (*cfg_ptr).sample_rate };
+            let rate = if sample_rate == 0 {
+                1u64
+            } else {
+                sample_rate as u64
+            };
+            if let Some(c) = MW_SDT_TRACE_SAMPLE.get_ptr_mut(MONITOR_ID) {
+                unsafe {
+                    *c = (*c).wrapping_add(1);
+                    if (*c) % rate != 0 {
+                        return 0;
+                    }
+                }
+            }
+
+            let ev_ptr = match MW_SDT_TRACE_SCRATCH.get_ptr_mut(MONITOR_ID) {
+                Some(p) => p,
+                None => return 0,
+            };
+            unsafe {
+                let ev = &mut *ev_ptr;
+                ev.ktime_ns = bpf_ktime_get_ns();
+                ev.pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+                ev.cpu = bpf_get_smp_processor_id();
+                ev.monitor_id = MONITOR_ID;
+                ev.n_fields = n_fields;
+                ev._pad[0] = 0;
+                ev._pad[1] = 0;
+                ev._pad[2] = 0;
+
+                if n_fields > 0 {
+                    read_mw_sdt_field!(ctx, cfg_ptr, 0, &mut ev.fields[0]);
+                }
+                if n_fields > 1 {
+                    read_mw_sdt_field!(ctx, cfg_ptr, 1, &mut ev.fields[1]);
+                }
+                if n_fields > 2 {
+                    read_mw_sdt_field!(ctx, cfg_ptr, 2, &mut ev.fields[2]);
+                }
+                if n_fields > 3 {
+                    read_mw_sdt_field!(ctx, cfg_ptr, 3, &mut ev.fields[3]);
+                }
+                if n_fields > 4 {
+                    read_mw_sdt_field!(ctx, cfg_ptr, 4, &mut ev.fields[4]);
+                }
+                if n_fields > 5 {
+                    read_mw_sdt_field!(ctx, cfg_ptr, 5, &mut ev.fields[5]);
+                }
+                if n_fields > 6 {
+                    read_mw_sdt_field!(ctx, cfg_ptr, 6, &mut ev.fields[6]);
+                }
+                if n_fields > 7 {
+                    read_mw_sdt_field!(ctx, cfg_ptr, 7, &mut ev.fields[7]);
+                }
+
+                if MW_SDT_TRACE_EVENTS.output(ev, 0).is_err() {
+                    if let Some(d) = MW_SDT_TRACE_DROPS.get_ptr_mut(MONITOR_ID) {
+                        *d = (*d).wrapping_add(1);
+                    }
+                }
+            }
+            0
         }
     };
 }

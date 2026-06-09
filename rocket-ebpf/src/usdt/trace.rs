@@ -10,12 +10,13 @@ use aya::Ebpf;
 use aya::Pod;
 use rocket_ebpf_common::{
     MwSdtFieldSpec, MwSdtTraceCfg, MwSdtTraceEvent, MW_SDT_FIELD_HEX_PTR, MW_SDT_FIELD_INT64,
-    MW_SDT_FIELD_STRING, MW_SDT_FIELD_UINT64, MW_SDT_MAX_FIELDS, MW_SDT_STR_MAX,
+    MW_SDT_FIELD_STRING, MW_SDT_FIELD_UINT64, MW_SDT_LOC_MEM, MW_SDT_LOC_REG, MW_SDT_MAX_FIELDS,
+    MW_SDT_STR_MAX,
 };
 
 use super::attach::resolve_binary_for_attach;
 use super::monitor_id::{mw_sdt_trace_program_name, validate_monitor_id};
-use super::stapsdt::{find_probe, UsdtProbe};
+use super::stapsdt::{find_probe, UsdtArgLoc, UsdtProbe};
 
 /// 用户态字段声明（配置 / CLI）。
 #[derive(Debug, Clone)]
@@ -78,7 +79,11 @@ pub fn parse_field_spec(raw: &str) -> anyhow::Result<MwSdtFieldDecl> {
     })
 }
 
-pub fn build_trace_cfg(fields: &[MwSdtFieldDecl], sample_rate: u32) -> anyhow::Result<MwSdtTraceCfg> {
+pub fn build_trace_cfg(
+    fields: &[MwSdtFieldDecl],
+    sample_rate: u32,
+    probe: &UsdtProbe,
+) -> anyhow::Result<MwSdtTraceCfg> {
     if fields.is_empty() {
         bail!("至少需要一个 fields 项");
     }
@@ -90,20 +95,25 @@ pub fn build_trace_cfg(fields: &[MwSdtFieldDecl], sample_rate: u32) -> anyhow::R
         sample_rate: sample_rate.max(1),
         n_fields: fields.len() as u8,
         _pad: [0; 3],
-        fields: [MwSdtFieldSpec {
-            arg_index: 0,
-            field_type: 0,
-            _pad: [0; 2],
-            max_len: 0,
-        }; MW_SDT_MAX_FIELDS],
+        fields: [MwSdtFieldSpec::default(); MW_SDT_MAX_FIELDS],
     };
     for (i, f) in fields.iter().enumerate() {
         if !seen.insert(f.name.as_str()) {
             bail!("字段名重复: {}", f.name);
         }
-        if f.index >= 9 {
-            bail!("arg index 须 < 9（MW_SDT 最多 9 个参数）");
-        }
+        let loc = probe
+            .arg_locs
+            .get(f.index as usize)
+            .with_context(|| {
+                format!(
+                    "字段 {} 的 index={} 超出 USDT {}:{} 参数数量 {}",
+                    f.name,
+                    f.index,
+                    probe.provider,
+                    probe.name,
+                    probe.arg_locs.len()
+                )
+            })?;
         let max_len = if f.field_type == MwSdtFieldType::String {
             if f.max_len == 0 {
                 MW_SDT_STR_MAX as u16
@@ -113,34 +123,51 @@ pub fn build_trace_cfg(fields: &[MwSdtFieldDecl], sample_rate: u32) -> anyhow::R
         } else {
             0
         };
-        out.fields[i] = MwSdtFieldSpec {
-            arg_index: f.index,
-            field_type: f.field_type.to_ebpf(),
-            _pad: [0; 2],
-            max_len,
-        };
+        out.fields[i] = loc_to_field_spec(*loc, f.field_type.to_ebpf(), max_len);
     }
     Ok(out)
 }
 
+fn loc_to_field_spec(loc: UsdtArgLoc, field_type: u8, max_len: u16) -> MwSdtFieldSpec {
+    match loc {
+        UsdtArgLoc::Reg { reg, width, signed } => MwSdtFieldSpec {
+            field_type,
+            loc_kind: MW_SDT_LOC_REG,
+            reg,
+            width,
+            sign_ext: u8::from(signed),
+            _pad: [0; 3],
+            mem_offset: 0,
+            max_len,
+        },
+        UsdtArgLoc::Mem {
+            base_reg,
+            offset,
+            width,
+            signed,
+        } => MwSdtFieldSpec {
+            field_type,
+            loc_kind: MW_SDT_LOC_MEM,
+            reg: base_reg,
+            width,
+            sign_ext: u8::from(signed),
+            _pad: [0; 3],
+            mem_offset: offset,
+            max_len,
+        },
+    }
+}
+
 pub fn validate_fields_against_probe(fields: &[MwSdtFieldDecl], probe: &UsdtProbe) -> anyhow::Result<()> {
     for f in fields {
-        if probe.arg_count > 0 && f.index as usize >= probe.arg_count {
+        if f.index as usize >= probe.arg_locs.len() {
             bail!(
                 "字段 {} 的 index={} 超出探测点 {}:{} 的参数数量 {}",
                 f.name,
                 f.index,
                 probe.provider,
                 probe.name,
-                probe.arg_count
-            );
-        }
-        if probe.arg_count == 0 && f.index > 0 {
-            bail!(
-                "探测点 {}:{} 无参数，字段 {} 的 index 须为 0",
-                probe.provider,
-                probe.name,
-                f.name
+                probe.arg_locs.len()
             );
         }
     }
@@ -243,9 +270,20 @@ pub fn decode_trace_event(
     out
 }
 
+/// 读取第 `field_index` 个字段的原始 i64（聚合用）。
+pub fn trace_field_i64(ev: &MwSdtTraceEvent, field_index: usize) -> Option<i64> {
+    if field_index >= ev.n_fields as usize {
+        return None;
+    }
+    Some(ev.fields[field_index].i64)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        build_trace_cfg, parse_field_spec, MwSdtFieldDecl, MwSdtFieldType, UsdtProbe,
+    };
+    use super::super::stapsdt::parse_arg_template;
 
     #[test]
     fn parse_field_spec_ok() {
@@ -257,6 +295,14 @@ mod tests {
 
     #[test]
     fn build_trace_cfg_rejects_duplicate_names() {
+        let probe = UsdtProbe {
+            provider: "p".into(),
+            name: "n".into(),
+            pc_offset: 0,
+            arg_count: 2,
+            arg_template: "-8@%rdi -8@%rsi".into(),
+            arg_locs: parse_arg_template("-8@%rdi -8@%rsi").unwrap(),
+        };
         let fields = vec![
             MwSdtFieldDecl {
                 index: 0,
@@ -271,6 +317,6 @@ mod tests {
                 max_len: 0,
             },
         ];
-        assert!(build_trace_cfg(&fields, 1).is_err());
+        assert!(build_trace_cfg(&fields, 1, &probe).is_err());
     }
 }

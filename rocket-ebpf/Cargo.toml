@@ -40,12 +40,13 @@ aya-build = { workspace = true }
 cargo_metadata = { workspace = true }
 rocket-ebpf-ebpf = { path = "../rocket-ebpf-ebpf" }
 
-[dev-dependencies]
-libc = { workspace = true }
-
 [features]
 default = ["web"]
 web = ["dep:axum", "dep:tokio-stream"]
+
+[dev-dependencies]
+aya-obj = "0.2"
+glob = "0.3"
 
 [[bin]]
 name = "rocket-ebpf"

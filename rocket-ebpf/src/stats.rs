@@ -50,7 +50,7 @@ fn push_capped(buf: &mut Vec<f64>, v: f64, cap: usize) {
     buf.push(v);
 }
 
-fn percentile(samples: &[f64], p: f64) -> Option<f64> {
+pub fn percentile(samples: &[f64], p: f64) -> Option<f64> {
     if samples.is_empty() {
         return None;
     }

@@ -173,8 +173,80 @@ fn validate_mw_sdt_trace(cfg: &MwSdtTraceConfig) -> anyhow::Result<()> {
         bail!("monitor {name} 的 fields 不能为空");
     }
     let decls = field_yaml_to_decls(&cfg.fields)?;
-    crate::usdt::build_trace_cfg(&decls, cfg.probe.sample_rate)?;
+    if !cfg.emit_raw && cfg.aggregate.is_none() {
+        bail!("monitor {name} 须配置 aggregate 或设置 emit_raw: true");
+    }
+    if let Some(agg) = &cfg.aggregate {
+        validate_trace_aggregate(name, &decls, agg)?;
+    }
+    if cfg.probe.binary.exists() {
+        let probe = crate::usdt::find_probe(
+            &cfg.probe.binary,
+            &cfg.probe.provider,
+            &cfg.probe.probe,
+        )?;
+        crate::usdt::validate_fields_against_probe(&decls, &probe)?;
+        crate::usdt::build_trace_cfg(&decls, cfg.probe.sample_rate, &probe)?;
+    }
     Ok(())
+}
+
+fn validate_trace_aggregate(
+    monitor: &str,
+    decls: &[crate::usdt::MwSdtFieldDecl],
+    agg: &MwSdtTraceAggregateConfig,
+) -> anyhow::Result<()> {
+    if agg.interval_secs == 0 {
+        bail!("monitor {monitor} aggregate.interval_secs 须 >= 1");
+    }
+    if agg.by.trim().is_empty() {
+        bail!("monitor {monitor} aggregate.by 不能为空");
+    }
+    if agg.metric.trim().is_empty() {
+        bail!("monitor {monitor} aggregate.metric 不能为空");
+    }
+    if agg.by == agg.metric {
+        bail!("monitor {monitor} aggregate.by 与 aggregate.metric 不能相同");
+    }
+    let by = find_trace_field_decl(decls, &agg.by)
+        .with_context(|| format!("monitor {monitor} aggregate.by={} 不在 fields 中", agg.by))?;
+    let metric = find_trace_field_decl(decls, &agg.metric).with_context(|| {
+        format!(
+            "monitor {monitor} aggregate.metric={} 不在 fields 中",
+            agg.metric
+        )
+    })?;
+    if !matches!(
+        by.field_type,
+        crate::usdt::MwSdtFieldType::Int64 | crate::usdt::MwSdtFieldType::Uint64
+    ) {
+        bail!(
+            "monitor {monitor} aggregate.by={} 须为 int64/uint64",
+            agg.by
+        );
+    }
+    if !matches!(
+        metric.field_type,
+        crate::usdt::MwSdtFieldType::Int64 | crate::usdt::MwSdtFieldType::Uint64
+    ) {
+        bail!(
+            "monitor {monitor} aggregate.metric={} 须为 int64/uint64",
+            agg.metric
+        );
+    }
+    let _ = crate::trace_agg::StatsSpec::parse(&agg.stats)?;
+    let _ = crate::trace_agg::MetricUnit::parse(&agg.metric_unit)?;
+    Ok(())
+}
+
+fn find_trace_field_decl<'a>(
+    decls: &'a [crate::usdt::MwSdtFieldDecl],
+    name: &str,
+) -> anyhow::Result<&'a crate::usdt::MwSdtFieldDecl> {
+    decls
+        .iter()
+        .find(|f| f.name == name)
+        .with_context(|| format!("未找到字段 {name}"))
 }
 
 pub fn field_yaml_to_decls(fields: &[MwSdtFieldYaml]) -> anyhow::Result<Vec<crate::usdt::MwSdtFieldDecl>> {
@@ -486,12 +558,64 @@ impl Default for MwSdtFieldYaml {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+pub struct MwSdtTraceAggregateConfig {
+    pub interval_secs: u64,
+    pub by: String,
+    pub metric: String,
+    #[serde(default = "default_trace_agg_stats")]
+    pub stats: Vec<String>,
+    #[serde(default = "default_trace_max_groups")]
+    pub max_groups: usize,
+    #[serde(default = "default_trace_sample_cap")]
+    pub sample_cap: usize,
+    #[serde(default)]
+    pub metric_unit: String,
+}
+
+fn default_trace_agg_stats() -> Vec<String> {
+    vec![
+        "count".into(),
+        "mean".into(),
+        "min".into(),
+        "max".into(),
+        "p50".into(),
+        "p99".into(),
+    ]
+}
+
+fn default_trace_max_groups() -> usize {
+    64
+}
+
+fn default_trace_sample_cap() -> usize {
+    8192
+}
+
+impl Default for MwSdtTraceAggregateConfig {
+    fn default() -> Self {
+        Self {
+            interval_secs: 1,
+            by: String::new(),
+            metric: String::new(),
+            stats: default_trace_agg_stats(),
+            max_groups: default_trace_max_groups(),
+            sample_cap: default_trace_sample_cap(),
+            metric_unit: "ns".into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct MwSdtTraceConfig {
     #[serde(flatten)]
     pub common: MonitorCommon,
     #[serde(flatten)]
     pub probe: MwSdtTraceProbeConfig,
     pub fields: Vec<MwSdtFieldYaml>,
+    pub aggregate: Option<MwSdtTraceAggregateConfig>,
+    /// 为 true 时逐条推送原始 trace 事件；默认 false，仅输出 aggregate。
+    pub emit_raw: bool,
 }
 
 impl Default for MwSdtTraceConfig {
@@ -500,6 +624,8 @@ impl Default for MwSdtTraceConfig {
             common: MonitorCommon::default(),
             probe: MwSdtTraceProbeConfig::default(),
             fields: Vec::new(),
+            aggregate: None,
+            emit_raw: false,
         }
     }
 }
@@ -565,12 +691,18 @@ monitors:
   - type: mw_sdt_trace
     name: trace-test
     enabled: true
-    binary: /tmp/lib.so
+    binary: /nonexistent/rocket-ebpf-test/lib.so
     provider: func
     probe: enter
     sample_rate: 2
     fields:
-      - { index: 0, name: count, type: int64 }
+      - { index: 0, name: stream_id, type: int64 }
+      - { index: 1, name: latency, type: int64 }
+    aggregate:
+      interval_secs: 1
+      by: stream_id
+      metric: latency
+      metric_unit: ms
     outputs: [console]
 "#;
         let cfg: ServerConfig = serde_yaml::from_str(raw).expect("yaml");
@@ -579,7 +711,9 @@ monitors:
             panic!("expected mw_sdt_trace");
         };
         assert_eq!(m.probe.sample_rate, 2);
-        assert_eq!(m.fields[0].name, "count");
+        assert_eq!(m.fields[0].name, "stream_id");
+        assert!(m.aggregate.is_some());
+        assert!(!m.emit_raw);
     }
 
     #[test]
